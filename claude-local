@@ -1,0 +1,86 @@
+#!/bin/sh
+# claude-local: run Claude Code against a local Ollama model.
+#
+# Starts the shim proxy if it isn't running, then execs Claude Code with the
+# right env. Shell-agnostic (bash/zsh/fish). Extra args pass straight to claude.
+#
+#   claude-local                     # claude with defaults
+#   claude-local --resume            # any claude flag
+#
+# Env (all optional):
+#   CLAUDE_LOCAL_MODEL        model name for ANTHROPIC_MODEL  (default: first model in `ollama list`)
+#   CLAUDE_LOCAL_SHIM_PORT    shim listen port                (default: 11500)
+#   CLAUDE_LOCAL_OLLAMA_URL   Ollama upstream                 (default: http://localhost:11434)
+#   CLAUDE_LOCAL_SHIM_BIN     python interpreter for the shim (default: python3)
+#   CLAUDE_LOCAL_SHIM         explicit shim.py path   (default: <script dir>/shim.py)
+#   CLAUDE_LOCAL_NO_AUTOSTART skip auto-starting the shim     (default: 0)
+set -u
+
+# Resolve this script's directory (follows symlinks where possible).
+src="$0"
+while [ -h "$src" ]; do
+  dir=$(cd "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+ROOT=$(cd "$(dirname "$src")" && pwd)
+SHIM="${CLAUDE_LOCAL_SHIM:-$ROOT/shim.py}"
+
+PORT="${CLAUDE_LOCAL_SHIM_PORT:-11500}"
+OLLAMA_URL="${CLAUDE_LOCAL_OLLAMA_URL:-http://localhost:11434}"
+PY="${CLAUDE_LOCAL_SHIM_BIN:-python3}"
+BASE="http://127.0.0.1:$PORT"
+
+[ -f "$SHIM" ] || { echo "claude-local: shim not found at $SHIM" >&2; exit 1; }
+
+# Pick a model if the user didn't name one.
+if [ -z "${CLAUDE_LOCAL_MODEL:-}" ]; then
+  if command -v ollama >/dev/null 2>&1; then
+    CLAUDE_LOCAL_MODEL=$(ollama list 2>/dev/null | awk 'NR>1 && $4 ~ /GB|MB|B$/ {print $1; exit}')
+  fi
+  CLAUDE_LOCAL_MODEL="${CLAUDE_LOCAL_MODEL:-}"
+  if [ -z "$CLAUDE_LOCAL_MODEL" ]; then
+    echo "claude-local: no model set and none found via 'ollama list'." >&2
+    echo "claude-local: pull one (ollama pull qwen2.5-coder:14b) or set CLAUDE_LOCAL_MODEL." >&2
+    exit 1
+  fi
+  echo "claude-local: using model '$CLAUDE_LOCAL_MODEL' (set CLAUDE_LOCAL_MODEL to override)" >&2
+fi
+
+# Is the shim already answering?
+shim_up() {
+  curl -sf -m 2 "$BASE/v1/models" >/dev/null 2>&1
+}
+
+if [ "${CLAUDE_LOCAL_NO_AUTOSTART:-0}" = "1" ]; then
+  shim_up || { echo "claude-local: shim not running on $BASE (autostart disabled)." >&2; exit 1; }
+else
+  if ! shim_up; then
+    echo "claude-local: starting shim on 127.0.0.1:$PORT -> $OLLAMA_URL" >&2
+    mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/claude-local"
+    LOG="${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.log"
+    CLAUDE_LOCAL_SHIM_PORT="$PORT" CLAUDE_LOCAL_OLLAMA_URL="$OLLAMA_URL" \
+      nohup "$PY" "$SHIM" >>"$LOG" 2>&1 &
+    echo $! > "${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.pid"
+    # Ollama may be under load; be generous: ~30s budget, 2s per attempt.
+    started=0
+    i=0
+    while [ $i -lt 60 ]; do
+      if shim_up; then started=1; break; fi
+      i=$((i + 1))
+      sleep 0.5
+    done
+    [ "$started" = 1 ] || { echo "claude-local: shim failed to start; see $LOG" >&2; exit 1; }
+  fi
+fi
+
+# Sanity-check the upstream actually has the model (warn, don't hard-fail).
+if ! curl -sf -m 2 "$BASE/v1/models" 2>/dev/null | grep -q "\"$CLAUDE_LOCAL_MODEL\""; then
+  echo "claude-local: note: '$CLAUDE_LOCAL_MODEL' not visible in Ollama's /v1/models yet." >&2
+fi
+
+exec env \
+  ANTHROPIC_BASE_URL="$BASE" \
+  ANTHROPIC_MODEL="$CLAUDE_LOCAL_MODEL" \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL="$CLAUDE_LOCAL_MODEL" \
+  claude "$@"
