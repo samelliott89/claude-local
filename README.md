@@ -63,6 +63,29 @@ It deliberately sets **no** `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`.
 Your Claude login (if any) stays the auth source.
 That keeps claude.ai connectors available (see below).
 
+### Move a session between hosted and local
+
+Claude Code sessions are transcripts on disk. The model is stateless and
+re-reads the transcript every turn, from whatever backend the launcher
+points at. So a session started on a hosted Claude model continues on a
+local model — and back — with no conversion:
+
+```sh
+claude --resume                    # start or continue a session on hosted Claude
+claude-local --resume              # same session list — continue any of them locally
+claude-local --continue            # most recent session, whoever made it
+claude --resume <session-id>      # take a locally-made session back to hosted
+```
+
+Use it to draft cheaply on the local model and switch to a hosted model
+for the hard steps, or to keep working through an outage or offline.
+
+Caveats: the first local turn re-processes the whole transcript through
+your GPU (long wait on big sessions); sessions longer than the local
+model's context window need compaction first; and a small local model
+inherits a hosted-model transcript gracefully but performs like itself,
+not like the model that wrote it.
+
 ### Environment
 
 | Variable | Default | Purpose |
