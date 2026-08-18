@@ -27,6 +27,7 @@ straight at Ollama and drop the shim.
 
 ## Requirements
 
+- macOS or Linux (Windows: use WSL)
 - Python 3.8+ (standard library only)
 - `curl`
 - Ollama running, with at least one local model
