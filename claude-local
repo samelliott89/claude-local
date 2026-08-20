@@ -50,10 +50,27 @@ PY="${CLAUDE_LOCAL_SHIM_BIN:-python3}"
 if [ -n "$DIRECT_URL" ]; then
   # Direct mode: the upstream speaks the Anthropic Messages API itself.
   BASE="${DIRECT_URL%/}"
-  if ! curl -sf -m 2 "$BASE/v1/models" >/dev/null 2>&1; then
-    echo "claude-local: no server answering at $BASE" >&2
-    echo "claude-local: start one first (e.g. an SGLang server on that port)." >&2
-    exit 1
+  server_up() {
+    curl -sf -m 2 "$BASE/v1/models" >/dev/null 2>&1
+  }
+  if ! server_up; then
+    # Autostart: CLAUDE_LOCAL_SGLANG_START names a command that starts the
+    # server and returns once it is healthy. If unset, an `sglang-serve`
+    # script on PATH is used. Disabled by CLAUDE_LOCAL_NO_AUTOSTART=1.
+    starter="${CLAUDE_LOCAL_SGLANG_START:-}"
+    if [ -z "$starter" ] && command -v sglang-serve >/dev/null 2>&1; then
+      starter="sglang-serve start"
+    fi
+    if [ -n "$starter" ] && [ "${CLAUDE_LOCAL_NO_AUTOSTART:-0}" != "1" ]; then
+      echo "claude-local: server at $BASE is down; running: $starter" >&2
+      echo "claude-local: (model load can take minutes on a cold start)" >&2
+      $starter >&2 || { echo "claude-local: start command failed." >&2; exit 1; }
+    fi
+    if ! server_up; then
+      echo "claude-local: no server answering at $BASE" >&2
+      echo "claude-local: start one first (e.g. an SGLang server on that port)." >&2
+      exit 1
+    fi
   fi
   if [ -z "${CLAUDE_LOCAL_MODEL:-}" ]; then
     CLAUDE_LOCAL_MODEL=$(curl -sf -m 2 "$BASE/v1/models" \

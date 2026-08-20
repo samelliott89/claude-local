@@ -73,6 +73,11 @@ server. The model is auto-picked from the server's `/v1/models`
 (`CLAUDE_LOCAL_MODEL` overrides). Any server that speaks `/v1/messages`
 works — the flag name is just honest about what it was built for.
 Launcher-owned flags must come before `claude`'s own args.
+
+If the server is down, the launcher starts it: it runs
+`CLAUDE_LOCAL_SGLANG_START` if set, else `sglang-serve start` if a script
+by that name is on PATH. The command must return once the server is
+healthy. `CLAUDE_LOCAL_NO_AUTOSTART=1` disables this, like the shim.
 It deliberately sets **no** `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`.
 Your Claude login (if any) stays the auth source.
 That keeps claude.ai connectors available (see below).
