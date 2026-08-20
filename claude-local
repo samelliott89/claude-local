@@ -58,7 +58,10 @@ if [ -n "$DIRECT_URL" ]; then
     # server and returns once it is healthy. If unset, an `sglang-serve`
     # script on PATH is used. Disabled by CLAUDE_LOCAL_NO_AUTOSTART=1.
     starter="${CLAUDE_LOCAL_SGLANG_START:-}"
-    if [ -z "$starter" ] && command -v sglang-serve >/dev/null 2>&1; then
+    # The sglang-serve fallback only manages the default local port; do not
+    # let it "fix" an unreachable custom URL by starting a server elsewhere.
+    if [ -z "$starter" ] && [ "$BASE" = "http://localhost:30000" ] \
+        && command -v sglang-serve >/dev/null 2>&1; then
       starter="sglang-serve start"
     fi
     if [ -n "$starter" ] && [ "${CLAUDE_LOCAL_NO_AUTOSTART:-0}" != "1" ]; then
