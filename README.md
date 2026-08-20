@@ -59,6 +59,20 @@ claude-local -p "say hi" --max-turns 1    # headless
 The launcher starts the shim if it is not running, then execs `claude`
 with `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, and
 `ANTHROPIC_DEFAULT_HAIKU_MODEL` set.
+
+### SGLang and other Anthropic-native servers
+
+```sh
+claude-local --sglang                     # server on http://localhost:30000
+claude-local --sglang=http://host:port    # server elsewhere
+```
+
+SGLang serves the Anthropic Messages API natively (`/v1/messages`), so
+`--sglang` skips the shim entirely and points Claude Code straight at the
+server. The model is auto-picked from the server's `/v1/models`
+(`CLAUDE_LOCAL_MODEL` overrides). Any server that speaks `/v1/messages`
+works — the flag name is just honest about what it was built for.
+Launcher-owned flags must come before `claude`'s own args.
 It deliberately sets **no** `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`.
 Your Claude login (if any) stays the auth source.
 That keeps claude.ai connectors available (see below).
