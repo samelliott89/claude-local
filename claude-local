@@ -8,6 +8,7 @@
 #   claude-local --resume            # any claude flag
 #   claude-local --sglang            # SGLang server on :30000, no shim
 #   claude-local --sglang=http://host:port  # SGLang/Anthropic-compatible server elsewhere
+#   claude-local --hybrid            # main 27B on SGLang + small 1-bit on Ollama (routing shim)
 #
 # --sglang works with any server that speaks the Anthropic Messages API
 # natively (SGLang ships /v1/messages). No shim runs in that mode: the shim
@@ -21,6 +22,9 @@
 #   CLAUDE_LOCAL_SHIM_BIN     python interpreter for the shim (default: python3)
 #   CLAUDE_LOCAL_SHIM         explicit shim.py path   (default: <script dir>/shim.py)
 #   CLAUDE_LOCAL_NO_AUTOSTART skip auto-starting the shim     (default: 0)
+#   CLAUDE_LOCAL_SMALL_MODEL  small/haiku model for --hybrid  (default: the 1-bit 27B in Ollama)
+#   CLAUDE_LOCAL_HYBRID_PORT  routing-shim port for --hybrid  (default: 11501)
+#   CLAUDE_LOCAL_SGLANG_BASE  SGLang URL for --hybrid         (default: http://localhost:30000)
 set -u
 
 # Resolve this script's directory (follows symlinks where possible).
@@ -35,10 +39,12 @@ SHIM="${CLAUDE_LOCAL_SHIM:-$ROOT/shim.py}"
 
 # Launcher-owned flags must come before claude's own args.
 DIRECT_URL=""
+HYBRID=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sglang)   DIRECT_URL="http://localhost:30000"; shift ;;
     --sglang=*) DIRECT_URL="${1#--sglang=}"; shift ;;
+    --hybrid)   HYBRID=1; shift ;;
     *) break ;;
   esac
 done
@@ -46,6 +52,71 @@ done
 PORT="${CLAUDE_LOCAL_SHIM_PORT:-11500}"
 OLLAMA_URL="${CLAUDE_LOCAL_OLLAMA_URL:-http://localhost:11434}"
 PY="${CLAUDE_LOCAL_SHIM_BIN:-python3}"
+
+# Hybrid-mode settings (--hybrid): main 27B on SGLang, small 1-bit on Ollama.
+SGLANG_BASE="${CLAUDE_LOCAL_SGLANG_BASE:-http://localhost:30000}"
+HYBRID_PORT="${CLAUDE_LOCAL_HYBRID_PORT:-11501}"
+SMALL_MODEL="${CLAUDE_LOCAL_SMALL_MODEL:-hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ1_M}"
+
+# Is a server answering at <url>/v1/models?
+url_up() { curl -sf -m 2 "$1/v1/models" >/dev/null 2>&1; }
+
+# Bring SGLang up if it is down (honors CLAUDE_LOCAL_NO_AUTOSTART).
+sglang_autostart() {
+  url_up "$SGLANG_BASE" && return 0
+  starter="${CLAUDE_LOCAL_SGLANG_START:-}"
+  if [ -z "$starter" ] && [ "$SGLANG_BASE" = "http://localhost:30000" ] \
+      && command -v sglang-serve >/dev/null 2>&1; then
+    starter="sglang-serve start"
+  fi
+  if [ -n "$starter" ] && [ "${CLAUDE_LOCAL_NO_AUTOSTART:-0}" != "1" ]; then
+    echo "claude-local: SGLang at $SGLANG_BASE is down; running: $starter" >&2
+    echo "claude-local: (model load can take minutes on a cold start)" >&2
+    $starter >&2 || return 1
+  fi
+  url_up "$SGLANG_BASE"
+}
+
+# ---- Hybrid mode: main 27B on SGLang + small 1-bit on Ollama ----
+# One base URL (the routing shim, on its own port) serves both; the shim
+# splits by the request's model name. A dedicated port keeps it from
+# colliding with the plain Ollama shim. This branch execs or exits, so it
+# never falls through to the modes below.
+if [ "$HYBRID" = "1" ]; then
+  HBASE="http://127.0.0.1:$HYBRID_PORT"
+
+  [ -f "$SHIM" ] || { echo "claude-local: shim not found at $SHIM" >&2; exit 1; }
+  sglang_autostart || { echo "claude-local: no SGLang server answering at $SGLANG_BASE" >&2; exit 1; }
+
+  # Main model = whatever SGLang serves.
+  if [ -z "${CLAUDE_LOCAL_MODEL:-}" ]; then
+    CLAUDE_LOCAL_MODEL=$(curl -sf -m 2 "$SGLANG_BASE/v1/models" \
+      | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+      | sed 's/.*"\([^"]*\)"$/\1/')
+    [ -n "$CLAUDE_LOCAL_MODEL" ] || { echo "claude-local: no model id from $SGLANG_BASE; set CLAUDE_LOCAL_MODEL" >&2; exit 1; }
+  fi
+
+  # Start the routing shim if it is not already up on its port.
+  if [ "${CLAUDE_LOCAL_NO_AUTOSTART:-0}" != "1" ] && ! url_up "$HBASE"; then
+    echo "claude-local: starting routing shim on $HBASE (sglang=$SGLANG_BASE ollama=$OLLAMA_URL)" >&2
+    mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/claude-local"
+    HLOG="${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim-hybrid.log"
+    CLAUDE_LOCAL_SHIM_PORT="$HYBRID_PORT" CLAUDE_LOCAL_OLLAMA_URL="$OLLAMA_URL" \
+    CLAUDE_LOCAL_SGLANG_URL="$SGLANG_BASE" CLAUDE_LOCAL_SGLANG_MODELS="$CLAUDE_LOCAL_MODEL" \
+      nohup "$PY" "$SHIM" >>"$HLOG" 2>&1 &
+    echo $! > "${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim-hybrid.pid"
+    i=0
+    while [ $i -lt 60 ]; do url_up "$HBASE" && break; i=$((i + 1)); sleep 0.5; done
+    url_up "$HBASE" || { echo "claude-local: hybrid shim failed to start; see $HLOG" >&2; exit 1; }
+  fi
+
+  echo "claude-local: hybrid — main='$CLAUDE_LOCAL_MODEL' (SGLang) small='$SMALL_MODEL' (Ollama)" >&2
+  exec env \
+    ANTHROPIC_BASE_URL="$HBASE" \
+    ANTHROPIC_MODEL="$CLAUDE_LOCAL_MODEL" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="$SMALL_MODEL" \
+    claude "$@"
+fi
 
 if [ -n "$DIRECT_URL" ]; then
   # Direct mode: the upstream speaks the Anthropic Messages API itself.

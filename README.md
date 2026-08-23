@@ -129,6 +129,84 @@ Note that decode speed is rarely the real bottleneck: long turns are
 dominated by *prefill* of the uncached context, which no flag fixes.
 Shrinking the context (`/compact`) is what makes turns fast.
 
+### Running the SGLang server: `sglang-serve`
+
+`--sglang` needs a server to talk to. `sglang-serve` is the reference
+launcher this repo ships for one — a thin, opinionated wrapper around
+`sglang.launch_server`, installed alongside `claude-local`. Skip it if you
+run SGLang some other way; `--sglang` does not care who started the server.
+
+```sh
+sglang-serve start              # serve $SGLANG_MODEL
+sglang-serve start <hf-id>      # serve a specific model
+sglang-serve stop               # stop, and wait for VRAM to actually free
+sglang-serve status
+sglang-serve log
+```
+
+It exists mainly to encode a few things that are easy to get wrong:
+
+- **No `--attention-backend`.** SGLang picks `flashinfer`; see above for why
+  pinning `triton` is a bad trade.
+- **`FLASHINFER_DISABLE_VERSION_CHECK=1`** is set, which is the correct fix
+  for the cubin/python mismatch — not downgrading anything.
+- **Ollama models are evicted before launch.** SGLang sizes its KV pool
+  *once*, from free VRAM at startup, and holds that size for the process
+  lifetime. An 11GB model resident at start cost us 286878 → 120266 tokens
+  of pool. A pool smaller than your session hard-fails with
+  `Input length exceeds maximum allowed length` — which is what makes
+  `/compact` fail in long sessions.
+- **`stop` kills the whole process tree and blocks until VRAM is free.**
+  The scheduler child holds the memory, not the launcher pid, so a naive
+  `kill` leaves the GPU occupied and the next `start` sizes a tiny pool.
+
+Defaults suit one large GPU. Every knob is env-overridable:
+`SGLANG_VENV`, `SGLANG_PORT`, `SGLANG_MODEL`, `SGLANG_ALT_MODEL`,
+`SGLANG_DRAFT_MODEL` (empty disables speculative decoding),
+`SGLANG_DRAFT_TOKENS`, `SGLANG_MEM_FRACTION`, `SGLANG_REASONING_PARSER`,
+`SGLANG_TOOL_PARSER`, and `SGLANG_EXTRA_ARGS` appended verbatim.
+
+Two model-specific notes, if you serve Qwen3.8 like we do: it needs
+`--reasoning-parser qwen3 --tool-call-parser qwen3_coder` (the template
+emits `<function=...>` XML, not hermes JSON), and it is a hybrid Mamba
+model — each request reserves 5 Mamba state slots, so the default cache
+silently caps concurrency at 1. `--mamba-ssm-dtype bfloat16
+--max-mamba-cache-size 20` (both set here) took us from 1 to 4 concurrent
+requests, a 2.66x aggregate speedup. Avoid `--chunked-prefill-size 32768`:
+it doubles CUDA-graph capture shapes and OOMs at any useful pool size.
+
+### Hybrid: big model on SGLang, small model on Ollama
+
+```sh
+claude-local --hybrid
+```
+
+Claude Code uses a small "haiku" model for background chores —
+conversation titles, compaction — and the main model for everything else.
+`--hybrid` serves both at once: the big model on SGLang, a small one on
+Ollama, behind a single base URL.
+
+The shim does the splitting. In hybrid mode it becomes a model-aware
+router: requests whose model matches `CLAUDE_LOCAL_SGLANG_MODELS` go
+straight to SGLang untouched, everything else goes to Ollama with the
+usual system-message rewrite. It listens on its own port (11501) so it
+never collides with a plain-Ollama shim on 11500.
+
+```
+CLAUDE_LOCAL_SGLANG_BASE   http://localhost:30000   SGLang URL
+CLAUDE_LOCAL_SMALL_MODEL   (a small Ollama model)   the haiku slot
+CLAUDE_LOCAL_HYBRID_PORT   11501                    routing shim port
+```
+
+The router logs every request as `route <path> -> sglang|ollama
+(model=...)`, in `${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim-hybrid.log` —
+useful for confirming which slot a given piece of work actually lands in.
+
+Watch VRAM: both models resident on one GPU is tight. SGLang reserves its
+KV pool at startup and the Ollama model loads into whatever is left, so
+**do not restart SGLang while the small model is resident** — it would
+size its pool against the leftovers and stay that way.
+
 ### Move a session between hosted and local
 
 Claude Code sessions are transcripts on disk. The model is stateless and
@@ -162,8 +240,16 @@ not like the model that wrote it.
 | `CLAUDE_LOCAL_SHIM` | `<script dir>/shim.py` | explicit shim path |
 | `CLAUDE_LOCAL_SHIM_BIN` | `python3` | shim interpreter |
 | `CLAUDE_LOCAL_NO_AUTOSTART` | `0` | `1` = never auto-start the shim |
+| `CLAUDE_LOCAL_SGLANG_START` | `sglang-serve start` | command to bring SGLang up |
+| `CLAUDE_LOCAL_SGLANG_BASE` | `http://localhost:30000` | SGLang URL for `--hybrid` |
+| `CLAUDE_LOCAL_SMALL_MODEL` | a small Ollama model | haiku slot for `--hybrid` |
+| `CLAUDE_LOCAL_HYBRID_PORT` | `11501` | routing shim port for `--hybrid` |
+| `CLAUDE_LOCAL_SGLANG_URL` | — | shim: route matching models here |
+| `CLAUDE_LOCAL_SGLANG_MODELS` | — | shim: comma-separated models to route |
 
 Shim log: `${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.log`
+(hybrid: `shim-hybrid.log`). SGLang server log:
+`${XDG_RUNTIME_DIR:-/tmp}/sglang-serve/server.log`
 
 ## MCP and connectors
 

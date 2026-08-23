@@ -14,6 +14,8 @@ command -v claude >/dev/null 2>&1 || echo "install: note: 'claude' not found on 
 mkdir -p "$DEST"
 install -m 0755 "$ROOT/claude-local" "$DEST/claude-local"
 install -m 0755 "$ROOT/shim.py" "$DEST/shim.py"
+# Optional: only useful if you run SGLang locally, harmless otherwise.
+install -m 0755 "$ROOT/sglang-serve" "$DEST/sglang-serve"
 
 case ":$PATH:" in
   *":$DEST:"*) : ;;
@@ -24,5 +26,5 @@ case ":$PATH:" in
     ;;
 esac
 
-echo "installed: $DEST/claude-local (+ shim.py)"
+echo "installed: $DEST/claude-local (+ shim.py, sglang-serve)"
 echo "try:        claude-local"

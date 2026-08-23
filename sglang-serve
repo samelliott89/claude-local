@@ -1,0 +1,161 @@
+#!/bin/sh
+# sglang-serve: start/stop/status for a local SGLang server.
+#
+#   sglang-serve start            # $SGLANG_MODEL (default: Qwen/Qwen3.8-27B)
+#   sglang-serve start <hf-id>    # any model id
+#   sglang-serve start alt        # $SGLANG_ALT_MODEL, if you set one
+#   sglang-serve stop
+#   sglang-serve status
+#   sglang-serve log              # tail the server log
+#
+# Serves an OpenAI-compatible API (and Anthropic /v1/messages) on
+# http://localhost:$SGLANG_PORT/v1 — pair it with `claude-local --sglang`.
+#
+# This is the reference launcher the SGLang notes in the README describe.
+# It is tuned for a single large GPU; every knob below is env-overridable.
+#
+# Env (all optional):
+#   SGLANG_VENV        venv holding sglang      (default: ~/venvs/sglang)
+#   SGLANG_PORT        listen port              (default: 30000)
+#   SGLANG_MODEL       default model to serve
+#   SGLANG_ALT_MODEL   model for `start alt`
+#   SGLANG_DRAFT_MODEL speculative drafter      (empty = no speculation)
+#   SGLANG_DRAFT_TOKENS  draft tokens per step  (default: 8)
+#   SGLANG_MEM_FRACTION  --mem-fraction-static  (default: 0.72)
+#   SGLANG_EXTRA_ARGS  appended to the launch command verbatim
+set -u
+
+VENV="${SGLANG_VENV:-$HOME/venvs/sglang}"
+# CUDA-13 wheel layout; harmless if absent.
+NV="$VENV/lib/python3.12/site-packages/nvidia/cu13"
+PORT="${SGLANG_PORT:-30000}"
+RUNDIR="${XDG_RUNTIME_DIR:-/tmp}/sglang-serve"
+LOG="$RUNDIR/server.log"
+PIDFILE="$RUNDIR/server.pid"
+
+BASE_MODEL="${SGLANG_MODEL:-Qwen/Qwen3.8-27B}"
+ALT_MODEL="${SGLANG_ALT_MODEL:-$BASE_MODEL}"
+DRAFT_MODEL="${SGLANG_DRAFT_MODEL-incoai/Qwen3.8-27B-DFlash2}"
+
+cmd="${1:-status}"
+
+is_up() {
+  curl -sf -m 2 "http://localhost:$PORT/health" >/dev/null 2>&1
+}
+
+case "$cmd" in
+  start)
+    if is_up; then
+      echo "sglang-serve: already running on :$PORT"
+      exit 0
+    fi
+    # Selector comes from the argument, else SGLANG_SERVE_MODEL, else "base".
+    # Resolve it into a variable first: reading "$2" in the default branch
+    # breaks (set -u) whenever the selector came from the environment.
+    sel="${2:-${SGLANG_SERVE_MODEL:-base}}"
+    case "$sel" in
+      base) MODEL="$BASE_MODEL" ;;
+      alt)  MODEL="$ALT_MODEL" ;;
+      *)    MODEL="$sel" ;;
+    esac
+    mkdir -p "$RUNDIR"
+    # SGLang sizes its KV pool ONCE, from whatever VRAM is free at startup.
+    # A resident Ollama model shrinks that pool for the server's whole life
+    # (a 11GB model cost us 286878 -> 120266 tokens). Evict before loading.
+    if command -v ollama >/dev/null 2>&1 && [ -n "$(ollama ps 2>/dev/null | sed 1d)" ]; then
+      echo "sglang-serve: unloading Ollama models first (they shrink the KV pool)"
+      ollama ps | sed 1d | awk '{print $1}' | while read -r m; do
+        [ -n "$m" ] && ollama stop "$m" >/dev/null 2>&1
+      done
+      i=0
+      while [ $i -lt 30 ] && [ -n "$(ollama ps 2>/dev/null | sed 1d)" ]; do sleep 1; i=$((i + 1)); done
+    fi
+    # Speculative decoding is optional: SGLANG_DRAFT_MODEL="" disables it.
+    SPEC_ARGS=""
+    if [ -n "$DRAFT_MODEL" ]; then
+      SPEC_ARGS="--speculative-algorithm DFLASH \
+        --speculative-draft-model-path $DRAFT_MODEL \
+        --speculative-num-draft-tokens ${SGLANG_DRAFT_TOKENS:-8}"
+      echo "sglang-serve: starting $MODEL + $DRAFT_MODEL drafter on :$PORT"
+    else
+      echo "sglang-serve: starting $MODEL on :$PORT"
+    fi
+    echo "sglang-serve: log at $LOG"
+    # NOTE: no --attention-backend here on purpose. SGLang picks flashinfer,
+    # which is much faster than triton at long context (+47% decode at 30k,
+    # +59% at 120k on a 27B FP8 model). See the SGLang notes in the README —
+    # pinning triton to dodge a flashinfer import error is a bad trade;
+    # FLASHINFER_DISABLE_VERSION_CHECK=1 below is the right fix.
+    PATH="$NV/bin:$VENV/bin:$PATH" CUDA_HOME="$NV" \
+    LIBRARY_PATH="$NV/lib" LD_LIBRARY_PATH="$NV/lib" \
+    NVCC_PREPEND_FLAGS="-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK -I$NV/include" \
+    FLASHINFER_DISABLE_VERSION_CHECK=1 \
+    nohup "$VENV/bin/python" -m sglang.launch_server \
+      --model-path "$MODEL" \
+      $SPEC_ARGS \
+      --reasoning-parser "${SGLANG_REASONING_PARSER:-qwen3}" \
+      --tool-call-parser "${SGLANG_TOOL_PARSER:-qwen3_coder}" \
+      --kv-cache-dtype fp8_e4m3 \
+      --mem-fraction-static "${SGLANG_MEM_FRACTION:-0.72}" \
+      --mamba-ssm-dtype bfloat16 \
+      --max-mamba-cache-size 20 \
+      --sampling-backend pytorch \
+      --port "$PORT" ${SGLANG_EXTRA_ARGS:-} >>"$LOG" 2>&1 &
+    echo $! > "$PIDFILE"
+    # First start JIT-compiles kernels; model load takes a while regardless.
+    i=0
+    while [ $i -lt 360 ]; do
+      if is_up; then
+        echo "sglang-serve: up — http://localhost:$PORT/v1"
+        # Surface the KV pool: a small one means something else held VRAM at
+        # startup, and every request over that many tokens will 400.
+        grep -o "max_total_num_tokens=[0-9]*" "$LOG" | tail -1 \
+          | sed 's/^/sglang-serve: KV pool /'
+        exit 0
+      fi
+      [ $((i % 15)) -eq 14 ] && echo "sglang-serve: still loading ($((i * 2 + 2))s)..."
+      kill -0 "$(cat "$PIDFILE")" 2>/dev/null || {
+        echo "sglang-serve: server process died; last log lines:" >&2
+        tail -20 "$LOG" >&2
+        exit 1
+      }
+      i=$((i + 1))
+      sleep 2
+    done
+    echo "sglang-serve: not up after 12 min; check $LOG" >&2
+    exit 1
+    ;;
+  stop)
+    # Kill the whole tree (launcher + scheduler + detokenizer) — the
+    # scheduler child holds the VRAM, not the launcher pid.
+    pkill -f "sglang[.]launch_server" 2>/dev/null
+    pkill -f "sglang::scheduler" 2>/dev/null
+    pkill -f "sglang::detokenizer" 2>/dev/null
+    rm -f "$PIDFILE"
+    # Block until VRAM is actually released, so stop+start is safe.
+    i=0
+    while [ $i -lt 90 ]; do
+      used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || echo 0)
+      [ "${used:-0}" -lt 1024 ] && break
+      [ $((i % 10)) -eq 9 ] && echo "sglang-serve: waiting for VRAM release (${used} MiB)..."
+      sleep 2; i=$((i + 1))
+    done
+    [ $i -ge 90 ] && echo "sglang-serve: VRAM still held after 180s; pkill -9 the rest" >&2
+    echo "sglang-serve: stopped"
+    ;;
+  status)
+    if is_up; then
+      echo "sglang-serve: up on :$PORT"
+      curl -s "http://localhost:$PORT/get_model_info" 2>/dev/null && echo
+    else
+      echo "sglang-serve: down"
+    fi
+    ;;
+  log)
+    tail -f "$LOG"
+    ;;
+  *)
+    echo "usage: sglang-serve {start [base|alt|<hf-model-id>]|stop|status|log}" >&2
+    exit 1
+    ;;
+esac

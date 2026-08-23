@@ -28,6 +28,16 @@ HOST = os.environ.get("CLAUDE_LOCAL_SHIM_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CLAUDE_LOCAL_SHIM_PORT", "11500"))
 UPSTREAM = os.environ.get("CLAUDE_LOCAL_OLLAMA_URL", "http://localhost:11434").rstrip("/")
 
+# Hybrid routing (optional). When SGLANG_URL is set, requests whose model
+# name is in SGLANG_MODELS go to SGLANG_URL (a native Anthropic /v1/messages
+# server, e.g. SGLang); everything else goes to UPSTREAM (Ollama). This lets
+# one base URL serve a big main model on SGLang and a small model on Ollama.
+# SGLANG_URL empty = plain Ollama mode, no routing (existing behavior).
+SGLANG_URL = os.environ.get("CLAUDE_LOCAL_SGLANG_URL", "").rstrip("/")
+SGLANG_MODELS = {
+    m.strip() for m in os.environ.get("CLAUDE_LOCAL_SGLANG_MODELS", "").split(",") if m.strip()
+}
+
 # Headers dropped when forwarding client -> upstream.
 # content-length is recomputed by urllib for the (possibly rewritten) body.
 REQ_STRIP = {
@@ -83,10 +93,25 @@ class Proxy(http.server.BaseHTTPRequestHandler):
     def _upstream_request(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
-        if body and self.path.startswith("/v1/messages"):
+
+        model = None
+        if body:
+            try:
+                model = json.loads(body).get("model")
+            except Exception:
+                model = None
+
+        to_sglang = bool(SGLANG_URL and model and model in SGLANG_MODELS)
+        upstream = SGLANG_URL if to_sglang else UPSTREAM
+        # Only Ollama needs the mid-conversation system-message rewrite;
+        # SGLang speaks Anthropic natively and accepts system messages as-is.
+        if not to_sglang and body and self.path.startswith("/v1/messages"):
             body = rewrite(body)
 
-        out = f"{UPSTREAM}{self.path}"
+        self.log_message("route %s -> %s (model=%s)",
+                         self.path, "sglang" if to_sglang else "ollama", model)
+
+        out = f"{upstream}{self.path}"
         req = urllib.request.Request(out, data=body, method=self.command)
         for key, value in self.headers.items():
             if key.lower() in REQ_STRIP:
@@ -165,8 +190,13 @@ class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def main():
     server = ThreadingServer((HOST, PORT), Proxy)
+    if SGLANG_URL:
+        routes = (f" -> {UPSTREAM} (ollama) / {SGLANG_URL} "
+                  f"(sglang: {', '.join(sorted(SGLANG_MODELS))})")
+    else:
+        routes = f" -> {UPSTREAM}"
     sys.stderr.write(
-        f"[claude-local] shim {HOST}:{PORT} -> {UPSTREAM}\n"
+        f"[claude-local] shim {HOST}:{PORT}{routes}\n"
         f"[claude-local] point Claude Code at ANTHROPIC_BASE_URL=http://{HOST}:{PORT}\n"
     )
     sys.stderr.flush()

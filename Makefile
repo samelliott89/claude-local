@@ -5,6 +5,7 @@ PY ?= python3
 # Deterministic tests: no LLM, no network beyond localhost.
 unit:
 	$(PY) tests/test_rewrite.py
+	$(PY) tests/test_routing.py
 	$(PY) tests/test_mcp_server.py
 
 test: unit
