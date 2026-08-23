@@ -22,6 +22,7 @@
 #   SGLANG_DRAFT_MODEL speculative drafter      (empty = no speculation)
 #   SGLANG_DRAFT_TOKENS  draft tokens per step  (default: 8)
 #   SGLANG_MEM_FRACTION  --mem-fraction-static  (default: 0.72)
+#   SGLANG_ENABLE_METRICS  1 = serve /metrics (default: 1)
 #   SGLANG_EXTRA_ARGS  appended to the launch command verbatim
 set -u
 
@@ -81,6 +82,10 @@ case "$cmd" in
       echo "sglang-serve: starting $MODEL on :$PORT"
     fi
     echo "sglang-serve: log at $LOG"
+    # Prometheus metrics at http://localhost:$PORT/metrics. On by default —
+    # it is a single /metrics pull endpoint, no meaningful runtime cost.
+    METRICS_ARGS=""
+    [ "${SGLANG_ENABLE_METRICS:-1}" = "1" ] && METRICS_ARGS="--enable-metrics"
     # NOTE: no --attention-backend here on purpose. SGLang picks flashinfer,
     # which is much faster than triton at long context (+47% decode at 30k,
     # +59% at 120k on a 27B FP8 model). See the SGLang notes in the README —
@@ -100,6 +105,7 @@ case "$cmd" in
       --mamba-ssm-dtype bfloat16 \
       --max-mamba-cache-size 20 \
       --sampling-backend pytorch \
+      $METRICS_ARGS \
       --port "$PORT" ${SGLANG_EXTRA_ARGS:-} >>"$LOG" 2>&1 &
     echo $! > "$PIDFILE"
     # First start JIT-compiles kernels; model load takes a while regardless.

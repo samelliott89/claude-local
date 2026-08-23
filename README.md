@@ -163,7 +163,8 @@ It exists mainly to encode a few things that are easy to get wrong:
 Defaults suit one large GPU. Every knob is env-overridable:
 `SGLANG_VENV`, `SGLANG_PORT`, `SGLANG_MODEL`, `SGLANG_ALT_MODEL`,
 `SGLANG_DRAFT_MODEL` (empty disables speculative decoding),
-`SGLANG_DRAFT_TOKENS`, `SGLANG_MEM_FRACTION`, `SGLANG_REASONING_PARSER`,
+`SGLANG_DRAFT_TOKENS`, `SGLANG_MEM_FRACTION`, `SGLANG_ENABLE_METRICS`,
+`SGLANG_REASONING_PARSER`,
 `SGLANG_TOOL_PARSER`, and `SGLANG_EXTRA_ARGS` appended verbatim.
 
 Two model-specific notes, if you serve Qwen3.8 like we do: it needs
@@ -174,6 +175,49 @@ silently caps concurrency at 1. `--mamba-ssm-dtype bfloat16
 --max-mamba-cache-size 20` (both set here) took us from 1 to 4 concurrent
 requests, a 2.66x aggregate speedup. Avoid `--chunked-prefill-size 32768`:
 it doubles CUDA-graph capture shapes and OOMs at any useful pool size.
+
+### Monitoring: `/metrics` and `sglang-stats`
+
+`sglang-serve` starts the server with `--enable-metrics`, so it serves
+Prometheus metrics at `http://localhost:30000/metrics`
+(`SGLANG_ENABLE_METRICS=0` turns it off). Point Prometheus/Grafana at that
+endpoint if you want dashboards — SGLang ships a compose stack in its
+`examples/monitoring` directory.
+
+For a quick look without any of that, `sglang-stats` distills the ~80
+metrics down to the ones worth watching:
+
+```sh
+sglang-stats           # print once
+sglang-stats watch     # refresh every 2s
+```
+
+```
+model    orcarouter/Qwen3.8-27B-Uncensored-FP8
+load     running=1 queued=0 throughput=43 tok/s
+kv pool  686217 / 712136 free   usage=3.6%  prefix-hit=61.2%
+memory   weights=28.6GB kv=21.7GB cudagraph=3.4GB
+spec     accept-rate=21.1% accept-len=2.475
+latency  ttft=2.80s queue=0.00s
+sizes    prompt=12883 uncached=12883 generated=186 (mean tokens)
+```
+
+What to actually look at:
+
+- **`uncached`** — prompt tokens re-prefilled from scratch each turn. This
+  is the real cost driver in long sessions and what `/compact` reduces.
+  If it tracks `prompt` closely, prefix caching is not helping you.
+- **`kv pool`** — if free tokens fall below your session length, requests
+  hard-fail with `Input length exceeds maximum allowed length`. A pool much
+  smaller than expected means something held VRAM when the server started.
+- **`accept-rate`** — speculative decoding's real hit rate. Expect
+  0.15–0.30 on prose and code; predictable output inflates it well above
+  what you will see in practice, so tune against a realistic workload.
+- **`ttft` vs `throughput`** — a high TTFT with healthy throughput means
+  you are prefill-bound, not decode-bound. No sampling flag fixes that.
+
+Note the metric namespace is `sglang:foo` with a colon, not an underscore —
+easy to miss when writing your own queries.
 
 ### Hybrid: big model on SGLang, small model on Ollama
 

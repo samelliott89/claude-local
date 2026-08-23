@@ -3,7 +3,7 @@
 set -u
 
 DEST="${CLAUDE_LOCAL_DEST:-$HOME/.local/bin}"
-rm -f "$DEST/claude-local" "$DEST/shim.py" "$DEST/sglang-serve"
+rm -f "$DEST/claude-local" "$DEST/shim.py" "$DEST/sglang-serve" "$DEST/sglang-stats"
 
 # Stop a running shim started by this install (safe to miss).
 if [ -f "${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.pid" ]; then

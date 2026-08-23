@@ -16,6 +16,7 @@ install -m 0755 "$ROOT/claude-local" "$DEST/claude-local"
 install -m 0755 "$ROOT/shim.py" "$DEST/shim.py"
 # Optional: only useful if you run SGLang locally, harmless otherwise.
 install -m 0755 "$ROOT/sglang-serve" "$DEST/sglang-serve"
+install -m 0755 "$ROOT/sglang-stats" "$DEST/sglang-stats"
 
 case ":$PATH:" in
   *":$DEST:"*) : ;;
@@ -26,5 +27,5 @@ case ":$PATH:" in
     ;;
 esac
 
-echo "installed: $DEST/claude-local (+ shim.py, sglang-serve)"
+echo "installed: $DEST/claude-local (+ shim.py, sglang-serve, sglang-stats)"
 echo "try:        claude-local"

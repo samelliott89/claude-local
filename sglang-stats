@@ -1,0 +1,73 @@
+#!/bin/sh
+# sglang-stats: one-screen readout of a running SGLang server's /metrics.
+#
+#   sglang-stats            # print once
+#   sglang-stats watch      # refresh every 2s
+#
+# Needs the server started with metrics enabled (sglang-serve does by
+# default; otherwise pass --enable-metrics). The endpoint is ~70KB of
+# Prometheus text with 80+ metrics — this pulls out the handful that
+# actually tell you whether the server is healthy and fast.
+set -u
+
+PORT="${SGLANG_PORT:-30000}"
+URL="http://localhost:$PORT/metrics"
+
+show() {
+  raw=$(curl -sf -m 5 "$URL") || {
+    echo "sglang-stats: no metrics at $URL"
+    echo "  is the server up? does it have --enable-metrics?"
+    return 1
+  }
+
+  # Metric names are namespaced with a colon (sglang:foo), not an
+  # underscore. Strip the label block; keep the last field (the value).
+  get() { echo "$raw" | grep "^sglang:$1{" | head -1 | sed 's/{[^}]*}//' | awk '{print $2}'; }
+
+  model=$(echo "$raw" | grep -o 'model_name="[^"]*"' | head -1 | cut -d'"' -f2)
+  pool=$(get max_total_num_tokens)
+  avail=$(get kv_available_tokens)
+  usage=$(get token_usage)
+  running=$(get num_running_reqs)
+  queued=$(get num_queue_reqs)
+  tput=$(get gen_throughput)
+  accept=$(get spec_accept_rate)
+  acceptlen=$(get spec_accept_length)
+  hit=$(get cache_hit_rate)
+  wmem=$(get weight_memory_usage_gb)
+  kvmem=$(get kv_cache_memory_usage_gb)
+  gmem=$(get graph_memory_usage_gb)
+
+  # Histograms: derive the mean as sum/count.
+  mean() {
+    s=$(echo "$raw" | grep "^sglang:$1_sum{" | head -1 | sed 's/{[^}]*}//' | awk '{print $2}')
+    c=$(echo "$raw" | grep "^sglang:$1_count{" | head -1 | sed 's/{[^}]*}//' | awk '{print $2}')
+    [ -n "${s:-}" ] && [ -n "${c:-}" ] || { echo "-"; return; }
+    echo "$s $c" | awk '{ if ($2 > 0) printf "%.2f", $1/$2; else print "-" }'
+  }
+  ttft=$(mean time_to_first_token_seconds)
+  queue=$(mean queue_time_seconds)
+  prompt=$(mean prompt_tokens_histogram)
+  uncached=$(mean uncached_prompt_tokens_histogram)
+  gen=$(mean generation_tokens_histogram)
+
+  pct() { echo "${1:-0}" | awk '{printf "%.1f%%", $1*100}'; }
+  num() { echo "${1:-0}" | awk '{printf "%.0f", $1}'; }
+  gb()  { echo "${1:-0}" | awk '{printf "%.1fGB", $1}'; }
+
+  echo "model    $model"
+  echo "load     running=$(num "$running") queued=$(num "$queued") throughput=$(num "$tput") tok/s"
+  echo "kv pool  $(num "$avail") / $(num "$pool") free   usage=$(pct "$usage")  prefix-hit=$(pct "$hit")"
+  echo "memory   weights=$(gb "$wmem") kv=$(gb "$kvmem") cudagraph=$(gb "$gmem")"
+  echo "spec     accept-rate=$(pct "$accept") accept-len=${acceptlen:--}"
+  echo "latency  ttft=${ttft}s queue=${queue}s"
+  echo "sizes    prompt=${prompt} uncached=${uncached} generated=${gen} (mean tokens)"
+  # Uncached prompt tokens are the ones actually re-prefilled each turn:
+  # the real cost driver in long agent sessions, and what /compact reduces.
+}
+
+case "${1:-once}" in
+  watch) while true; do clear; date; echo; show; sleep 2; done ;;
+  once)  show ;;
+  *)     echo "usage: sglang-stats [once|watch]" >&2; exit 1 ;;
+esac
