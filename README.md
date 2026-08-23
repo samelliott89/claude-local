@@ -82,6 +82,53 @@ It deliberately sets **no** `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`.
 Your Claude login (if any) stays the auth source.
 That keeps claude.ai connectors available (see below).
 
+#### Don't "fix" the FlashInfer version mismatch
+
+A CUDA-13 SGLang venv can show a version mismatch between
+`flashinfer-cubin` and `flashinfer-python` (e.g. 0.6.13 vs 0.6.17), and
+importing `flashinfer` or `sgl_kernel` fails with:
+
+```
+RuntimeError: flashinfer-cubin version (0.6.13) does not match
+flashinfer version (0.6.17).
+```
+
+**This is cosmetic. Leave it alone.** `FLASHINFER_DISABLE_VERSION_CHECK=1`
+bypasses the check and everything imports and runs correctly — set that in
+whatever launches the server. The mismatch cannot be reconciled anyway:
+`flashinfer-cubin` has no release matching the newer `flashinfer-python`.
+
+Trying to downgrade instead (`pip install flashinfer-python==<cubin ver>`)
+fails partway through *and drags torch down with it* — cu130 → cu128 —
+which breaks `sgl_kernel` with a much less obvious error:
+
+```
+ImportError: .../sgl_kernel/.../common_ops.abi3.so: undefined symbol:
+_ZNR5torch7Library4_defEON3c1014FunctionSchemaE...
+```
+
+If you already did this, restore with:
+
+```sh
+pip install --index-url https://download.pytorch.org/whl/cu130 torch==2.13.0
+pip install 'cuda-python>=13.0'
+```
+
+Then check `python -m pip check` is clean and both imports work under
+`FLASHINFER_DISABLE_VERSION_CHECK=1`.
+
+#### Attention backend
+
+Let SGLang choose it. It picks `flashinfer`, which is significantly faster
+than `triton` at the long contexts Claude Code actually runs — measured on
+a 27B FP8 model: **+47% decode at 30k, +59% at 120k**. Pinning
+`--attention-backend triton` (a common workaround for the import error
+above) costs you exactly that.
+
+Note that decode speed is rarely the real bottleneck: long turns are
+dominated by *prefill* of the uncached context, which no flag fixes.
+Shrinking the context (`/compact`) is what makes turns fast.
+
 ### Move a session between hosted and local
 
 Claude Code sessions are transcripts on disk. The model is stateless and
