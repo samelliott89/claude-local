@@ -1,0 +1,126 @@
+#!/bin/sh
+# freetoken-serve: start/stop/status for a local FreeToken engine.
+#
+#   freetoken-serve start             # first model in ~/.freetoken/models
+#   freetoken-serve start <model-dir> # a specific model
+#   freetoken-serve stop
+#   freetoken-serve status
+#   freetoken-serve log               # tail the engine log
+#
+# Serves an OpenAI-compatible API (and Anthropic /v1/messages) on
+# http://localhost:$FREETOKEN_PORT — pair it with `claude-local --freetoken`.
+#
+# This is the reference launcher for the FreeToken engine (`ft serve`), the
+# same role sglang-serve plays for SGLang. Every knob below is env-overridable.
+#
+# Env (all optional):
+#   FREETOKEN_PORT       listen port             (default: 1919)
+#   FREETOKEN_FT_BIN     ft binary               (default: ft-freetoken on PATH,
+#                                                 else ~/.freetoken/venv/bin/ft)
+#   FREETOKEN_MODEL_DIR  where models live       (default: ~/.freetoken/models)
+#   FREETOKEN_MODEL      model to serve          (default: first dir in $FREETOKEN_MODEL_DIR)
+set -u
+
+PORT="${FREETOKEN_PORT:-1919}"
+RUNDIR="${XDG_RUNTIME_DIR:-/tmp}/freetoken-serve"
+LOG="$RUNDIR/server.log"
+PIDFILE="$RUNDIR/server.pid"
+MODEL_DIR="${FREETOKEN_MODEL_DIR:-$HOME/.freetoken/models}"
+
+# Prefer the user's ft binary (the wrapper sets up the CUDA-13 env FlashInfer
+# needs on Blackwell), then the FreeToken venv's ft.
+FT="${FREETOKEN_FT_BIN:-}"
+if [ -z "$FT" ]; then
+  if command -v ft-freetoken >/dev/null 2>&1; then FT="ft-freetoken";
+  else FT="$HOME/.freetoken/venv/bin/ft"; fi
+fi
+
+cmd="${1:-status}"
+
+is_up() {
+  curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1
+}
+
+# First real model dir under $MODEL_DIR (entries are symlinks to dirs, so use
+# a -d test that follows links rather than find -type d).
+default_model() {
+  for e in "$MODEL_DIR"/*; do
+    [ -d "$e" ] && { echo "$e"; return; }
+  done
+}
+
+case "$cmd" in
+  start)
+    if is_up; then
+      echo "freetoken-serve: already running on :$PORT"
+      exit 0
+    fi
+    MODEL="${2:-${FREETOKEN_MODEL:-}}"
+    if [ -z "$MODEL" ]; then
+      MODEL="$(default_model)"
+    fi
+    [ -n "$MODEL" ] && [ -d "$MODEL" ] || {
+      echo "freetoken-serve: no model dir found (looked in $MODEL_DIR)." >&2
+      echo "freetoken-serve: pass a path, or set FREETOKEN_MODEL." >&2
+      exit 1
+    }
+    mkdir -p "$RUNDIR"
+    echo "freetoken-serve: starting $MODEL on :$PORT"
+    echo "freetoken-serve: log at $LOG"
+    # setsid gives the engine its own process group so stop can kill it and
+    # any workers it spawns in one shot.
+    setsid nohup "$FT" serve --model-path "$MODEL" --port "$PORT" >>"$LOG" 2>&1 &
+    echo $! > "$PIDFILE"
+    # First start JIT-compiles kernels; model load takes a while regardless.
+    i=0
+    while [ $i -lt 360 ]; do
+      if is_up; then
+        echo "freetoken-serve: up — http://localhost:$PORT/v1"
+        exit 0
+      fi
+      [ $((i % 15)) -eq 14 ] && echo "freetoken-serve: still loading ($((i * 2 + 2))s)..."
+      kill -0 "$(cat "$PIDFILE")" 2>/dev/null || {
+        echo "freetoken-serve: engine process died; last log lines:" >&2
+        tail -20 "$LOG" >&2
+        exit 1
+      }
+      i=$((i + 1))
+      sleep 2
+    done
+    echo "freetoken-serve: not up after 12 min; check $LOG" >&2
+    exit 1
+    ;;
+  stop)
+    # Kill the whole process group — workers may hold the VRAM, not the leader.
+    if [ -f "$PIDFILE" ]; then
+      pid=$(cat "$PIDFILE")
+      kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    fi
+    pkill -f "ft serve --model-path" 2>/dev/null
+    rm -f "$PIDFILE"
+    # Block until VRAM is actually released, so stop+start is safe.
+    i=0
+    while [ $i -lt 90 ]; do
+      used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || echo 0)
+      [ "${used:-0}" -lt 1024 ] && break
+      [ $((i % 10)) -eq 9 ] && echo "freetoken-serve: waiting for VRAM release (${used} MiB)..."
+      sleep 2; i=$((i + 1)); done
+    [ $i -ge 90 ] && echo "freetoken-serve: VRAM still held after 180s; pkill -9 the rest" >&2
+    echo "freetoken-serve: stopped"
+    ;;
+  status)
+    if is_up; then
+      echo "freetoken-serve: up on :$PORT"
+      curl -s "http://127.0.0.1:$PORT/v1/models" 2>/dev/null && echo
+    else
+      echo "freetoken-serve: down"
+    fi
+    ;;
+  log)
+    tail -f "$LOG"
+    ;;
+  *)
+    echo "usage: freetoken-serve {start [<model-dir>]|stop|status|log}" >&2
+    exit 1
+    ;;
+esac

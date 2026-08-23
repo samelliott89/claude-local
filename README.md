@@ -65,6 +65,7 @@ with `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, and
 ```sh
 claude-local --sglang                     # server on http://localhost:30000
 claude-local --sglang=http://host:port    # server elsewhere
+claude-local --freetoken                  # FreeToken engine on http://127.0.0.1:1919
 ```
 
 SGLang serves the Anthropic Messages API natively (`/v1/messages`), so
@@ -219,6 +220,42 @@ What to actually look at:
 Note the metric namespace is `sglang:foo` with a colon, not an underscore —
 easy to miss when writing your own queries.
 
+### FreeToken: `--freetoken` and `freetoken-serve`
+
+```sh
+claude-local --freetoken                        # engine on http://127.0.0.1:1919
+claude-local --freetoken=http://host:port       # engine elsewhere
+```
+
+FreeToken's engine (`ft serve`) also serves the Anthropic Messages API at
+`/v1/messages`, so `--freetoken` behaves exactly like `--sglang`: no shim, the
+model auto-picked from `/v1/models` (the engine reports the model dir's
+basename as the id, e.g. `Qwen3.8-27B-ftw`), and `CLAUDE_LOCAL_MODEL`
+overrides.
+
+```sh
+freetoken-serve start              # first model in ~/.freetoken/models
+freetoken-serve start <model-dir>  # a specific model
+freetoken-serve stop               # stop, and wait for VRAM to actually free
+freetoken-serve status
+freetoken-serve log
+```
+
+`freetoken-serve` is the same kind of wrapper `sglang-serve` is for SGLang —
+it wraps `ft-freetoken serve --model-path <model> --port 1919`, waits for
+`/health`, and on `stop` kills the whole process group and blocks until VRAM is
+released. `claude-local --freetoken` runs `freetoken-serve start`
+automatically when the engine is down (disable with
+`CLAUDE_LOCAL_NO_AUTOSTART=1`).
+
+The `ft-freetoken` wrapper matters: on Blackwell (sm_120f) FlashInfer's JIT
+needs a CUDA ≥ 12.9 toolkit, and the wrapper points it at the CUDA-13 wheels
+inside the FreeToken venv. If you launch `ft` some other way, make sure that
+env is set or the kernels will fail to build.
+
+VRAM: the engine and an SGLang server do not coexist — stop one before starting
+the other (`sglang-serve stop`, then `freetoken-serve start`, or vice versa).
+
 ### Hybrid: big model on SGLang, small model on Ollama
 
 ```sh
@@ -290,10 +327,16 @@ not like the model that wrote it.
 | `CLAUDE_LOCAL_HYBRID_PORT` | `11501` | routing shim port for `--hybrid` |
 | `CLAUDE_LOCAL_SGLANG_URL` | — | shim: route matching models here |
 | `CLAUDE_LOCAL_SGLANG_MODELS` | — | shim: comma-separated models to route |
+| `CLAUDE_LOCAL_FREETOKEN_BASE` | `http://127.0.0.1:1919` | FreeToken URL for `--freetoken` |
+| `CLAUDE_LOCAL_FREETOKEN_START` | `freetoken-serve start` | command to bring FreeToken up |
+| `FREETOKEN_PORT` | `1919` | freetoken-serve listen port |
+| `FREETOKEN_MODEL` | first dir in `~/.freetoken/models` | freetoken-serve model path |
+| `FREETOKEN_FT_BIN` | `ft-freetoken` on PATH | freetoken-serve ft binary |
 
 Shim log: `${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.log`
 (hybrid: `shim-hybrid.log`). SGLang server log:
-`${XDG_RUNTIME_DIR:-/tmp}/sglang-serve/server.log`
+`${XDG_RUNTIME_DIR:-/tmp}/sglang-serve/server.log`. FreeToken engine log:
+`${XDG_RUNTIME_DIR:-/tmp}/freetoken-serve/server.log`
 
 ## MCP and connectors
 

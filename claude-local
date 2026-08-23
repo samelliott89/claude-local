@@ -8,11 +8,14 @@
 #   claude-local --resume            # any claude flag
 #   claude-local --sglang            # SGLang server on :30000, no shim
 #   claude-local --sglang=http://host:port  # SGLang/Anthropic-compatible server elsewhere
+#   claude-local --freetoken         # FreeToken engine on :1919, no shim
+#   claude-local --freetoken=http://host:port
 #   claude-local --hybrid            # main 27B on SGLang + small 1-bit on Ollama (routing shim)
 #
-# --sglang works with any server that speaks the Anthropic Messages API
-# natively (SGLang ships /v1/messages). No shim runs in that mode: the shim
-# only exists to work around Ollama's mid-conversation system-message bug.
+# --sglang and --freetoken work with any server that speaks the Anthropic
+# Messages API natively (SGLang and FreeToken both ship /v1/messages). No shim
+# runs in those modes: the shim only exists to work around Ollama's
+# mid-conversation system-message bug.
 #
 # Env (all optional):
 #   CLAUDE_LOCAL_MODEL        model name for ANTHROPIC_MODEL  (default: first model in `ollama list`,
@@ -25,6 +28,9 @@
 #   CLAUDE_LOCAL_SMALL_MODEL  small/haiku model for --hybrid  (default: the 1-bit 27B in Ollama)
 #   CLAUDE_LOCAL_HYBRID_PORT  routing-shim port for --hybrid  (default: 11501)
 #   CLAUDE_LOCAL_SGLANG_BASE  SGLang URL for --hybrid         (default: http://localhost:30000)
+#   CLAUDE_LOCAL_FREETOKEN_BASE  FreeToken URL for --freetoken (default: http://127.0.0.1:1919)
+#   CLAUDE_LOCAL_FREETOKEN_START command that brings FreeToken up (default: freetoken-serve start)
+#   FREETOKEN_PORT / FREETOKEN_MODEL / FREETOKEN_FT_BIN  freetoken-serve knobs (see that script)
 set -u
 
 # Resolve this script's directory (follows symlinks where possible).
@@ -39,12 +45,15 @@ SHIM="${CLAUDE_LOCAL_SHIM:-$ROOT/shim.py}"
 
 # Launcher-owned flags must come before claude's own args.
 DIRECT_URL=""
+DIRECT_PROVIDER=""
 HYBRID=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --sglang)   DIRECT_URL="http://localhost:30000"; shift ;;
-    --sglang=*) DIRECT_URL="${1#--sglang=}"; shift ;;
-    --hybrid)   HYBRID=1; shift ;;
+    --sglang)        DIRECT_URL="http://localhost:30000"; DIRECT_PROVIDER="sglang"; shift ;;
+    --sglang=*)      DIRECT_URL="${1#--sglang=}"; DIRECT_PROVIDER="sglang"; shift ;;
+    --freetoken)     DIRECT_URL="${CLAUDE_LOCAL_FREETOKEN_BASE:-http://127.0.0.1:1919}"; DIRECT_PROVIDER="freetoken"; shift ;;
+    --freetoken=*)   DIRECT_URL="${1#--freetoken=}"; DIRECT_PROVIDER="freetoken"; shift ;;
+    --hybrid)        HYBRID=1; shift ;;
     *) break ;;
   esac
 done
@@ -125,16 +134,25 @@ if [ -n "$DIRECT_URL" ]; then
     curl -sf -m 2 "$BASE/v1/models" >/dev/null 2>&1
   }
   if ! server_up; then
-    # Autostart: CLAUDE_LOCAL_SGLANG_START names a command that starts the
-    # server and returns once it is healthy. If unset, an `sglang-serve`
-    # script on PATH is used. Disabled by CLAUDE_LOCAL_NO_AUTOSTART=1.
-    starter="${CLAUDE_LOCAL_SGLANG_START:-}"
-    # The sglang-serve fallback only manages the default local port; do not
-    # let it "fix" an unreachable custom URL by starting a server elsewhere.
-    if [ -z "$starter" ] && [ "$BASE" = "http://localhost:30000" ] \
-        && command -v sglang-serve >/dev/null 2>&1; then
-      starter="sglang-serve start"
-    fi
+    # Autostart: a <PROVIDER>_START env names a command that starts the server
+    # and returns once it is healthy. If unset, the matching *-serve script on
+    # PATH is used. Disabled by CLAUDE_LOCAL_NO_AUTOSTART=1.
+    case "$DIRECT_PROVIDER" in
+      freetoken)
+        starter="${CLAUDE_LOCAL_FREETOKEN_START:-}"
+        # Only manage the default local port; don't "fix" an unreachable custom
+        # URL by starting a server elsewhere.
+        if [ -z "$starter" ] && [ "$BASE" = "http://127.0.0.1:1919" ] \
+            && command -v freetoken-serve >/dev/null 2>&1; then
+          starter="freetoken-serve start"
+        fi ;;
+      *)
+        starter="${CLAUDE_LOCAL_SGLANG_START:-}"
+        if [ -z "$starter" ] && [ "$BASE" = "http://localhost:30000" ] \
+            && command -v sglang-serve >/dev/null 2>&1; then
+          starter="sglang-serve start"
+        fi ;;
+    esac
     if [ -n "$starter" ] && [ "${CLAUDE_LOCAL_NO_AUTOSTART:-0}" != "1" ]; then
       echo "claude-local: server at $BASE is down; running: $starter" >&2
       echo "claude-local: (model load can take minutes on a cold start)" >&2
@@ -142,7 +160,10 @@ if [ -n "$DIRECT_URL" ]; then
     fi
     if ! server_up; then
       echo "claude-local: no server answering at $BASE" >&2
-      echo "claude-local: start one first (e.g. an SGLang server on that port)." >&2
+      case "$DIRECT_PROVIDER" in
+        freetoken) echo "claude-local: start one first (e.g. freetoken-serve start)." >&2 ;;
+        *)         echo "claude-local: start one first (e.g. an SGLang server on that port)." >&2 ;;
+      esac
       exit 1
     fi
   fi

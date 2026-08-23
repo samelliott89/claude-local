@@ -14,9 +14,10 @@ command -v claude >/dev/null 2>&1 || echo "install: note: 'claude' not found on 
 mkdir -p "$DEST"
 install -m 0755 "$ROOT/claude-local" "$DEST/claude-local"
 install -m 0755 "$ROOT/shim.py" "$DEST/shim.py"
-# Optional: only useful if you run SGLang locally, harmless otherwise.
+# Optional: only useful if you run these servers locally, harmless otherwise.
 install -m 0755 "$ROOT/sglang-serve" "$DEST/sglang-serve"
 install -m 0755 "$ROOT/sglang-stats" "$DEST/sglang-stats"
+install -m 0755 "$ROOT/freetoken-serve" "$DEST/freetoken-serve"
 
 case ":$PATH:" in
   *":$DEST:"*) : ;;
@@ -27,5 +28,5 @@ case ":$PATH:" in
     ;;
 esac
 
-echo "installed: $DEST/claude-local (+ shim.py, sglang-serve, sglang-stats)"
+echo "installed: $DEST/claude-local (+ shim.py, sglang-serve, sglang-stats, freetoken-serve)"
 echo "try:        claude-local"
