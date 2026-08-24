@@ -19,6 +19,7 @@
 #                                                 else ~/.freetoken/venv/bin/ft)
 #   FREETOKEN_MODEL_DIR  where models live       (default: ~/.freetoken/models)
 #   FREETOKEN_MODEL      model to serve          (default: first dir in $FREETOKEN_MODEL_DIR)
+#   FREETOKEN_ARGS       extra `ft serve` flags   (default: the tuned set below)
 set -u
 
 PORT="${FREETOKEN_PORT:-1919}"
@@ -26,6 +27,18 @@ RUNDIR="${XDG_RUNTIME_DIR:-/tmp}/freetoken-serve"
 LOG="$RUNDIR/server.log"
 PIDFILE="$RUNDIR/server.pid"
 MODEL_DIR="${FREETOKEN_MODEL_DIR:-$HOME/.freetoken/models}"
+
+# Defaults tuned for an interactive Claude Code session:
+#   moe-cache-auto      keep MoE experts resident instead of streaming them over
+#                       PCIe every decode step (the difference between ~21 and
+#                       ~40 tok/s on this box)
+#   kv-reserve-tokens   KV floor before experts fill the rest — 192k tokens is
+#                       plenty for a coding session; the 460k default ate 28 GiB
+#                       and left nothing for experts
+#   special-token-ckpt  GDN-hybrid prefix reuse across tool calls; without it
+#                       every turn re-prefills the whole conversation
+#   enable-cache-report Anthropic-style cache_read_input_tokens in usage
+EXTRA_ARGS="${FREETOKEN_ARGS:---moe-cache-auto --kv-reserve-tokens 196608 --enable-special-token-ckpt --enable-cache-report}"
 
 # Prefer the user's ft binary (the wrapper sets up the CUDA-13 env FlashInfer
 # needs on Blackwell), then the FreeToken venv's ft.
@@ -69,7 +82,9 @@ case "$cmd" in
     echo "freetoken-serve: log at $LOG"
     # setsid gives the engine its own process group so stop can kill it and
     # any workers it spawns in one shot.
-    setsid nohup "$FT" serve --model-path "$MODEL" --port "$PORT" >>"$LOG" 2>&1 &
+    # EXTRA_ARGS is deliberately unquoted — it is a flag list.
+    # shellcheck disable=SC2086
+    setsid nohup "$FT" serve --model-path "$MODEL" --port "$PORT" $EXTRA_ARGS >>"$LOG" 2>&1 &
     echo $! > "$PIDFILE"
     # First start JIT-compiles kernels; model load takes a while regardless.
     i=0
