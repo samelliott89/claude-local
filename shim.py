@@ -38,6 +38,17 @@ SGLANG_MODELS = {
     m.strip() for m in os.environ.get("CLAUDE_LOCAL_SGLANG_MODELS", "").split(",") if m.strip()
 }
 
+# Thinking override (optional). Claude Code always sends
+# thinking:{"type":"adaptive"}, which servers that only know "enabled"/
+# "disabled" ignore — so the checkpoint's own default applies (xhigh on
+# Qwen3.8, i.e. it thinks hard about "say hi"). "off"/"on" rewrites that field
+# to a type the server acts on. Empty = leave the request alone.
+THINKING = os.environ.get("CLAUDE_LOCAL_THINKING", "").strip().lower()
+
+# Native mode: the upstream speaks Anthropic itself, so skip the Ollama
+# system-message rewrite and just proxy (plus any THINKING override).
+NATIVE = os.environ.get("CLAUDE_LOCAL_NATIVE", "") == "1"
+
 # Headers dropped when forwarding client -> upstream.
 # content-length is recomputed by urllib for the (possibly rewritten) body.
 REQ_STRIP = {
@@ -52,6 +63,20 @@ RESP_STRIP = {
     "connection", "keep-alive", "upgrade",
     "proxy-authenticate", "proxy-authorization", "te", "trailer",
 }
+
+
+def set_thinking(body: bytes) -> bytes:
+    """Force the thinking mode Claude Code won't let us set."""
+    if THINKING not in ("off", "on"):
+        return body
+    try:
+        req = json.loads(body)
+    except Exception:
+        return body
+    if not isinstance(req, dict):
+        return body
+    req["thinking"] = {"type": "disabled" if THINKING == "off" else "enabled"}
+    return json.dumps(req).encode()
 
 
 def rewrite(body: bytes) -> bytes:
@@ -105,8 +130,10 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         upstream = SGLANG_URL if to_sglang else UPSTREAM
         # Only Ollama needs the mid-conversation system-message rewrite;
         # SGLang speaks Anthropic natively and accepts system messages as-is.
-        if not to_sglang and body and self.path.startswith("/v1/messages"):
-            body = rewrite(body)
+        if body and self.path.startswith("/v1/messages"):
+            if not to_sglang and not NATIVE:
+                body = rewrite(body)
+            body = set_thinking(body)
 
         self.log_message("route %s -> %s (model=%s)",
                          self.path, "sglang" if to_sglang else "ollama", model)

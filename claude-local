@@ -30,6 +30,8 @@
 #   CLAUDE_LOCAL_SGLANG_BASE  SGLang URL for --hybrid         (default: http://localhost:30000)
 #   CLAUDE_LOCAL_FREETOKEN_BASE  FreeToken URL for --freetoken (default: http://127.0.0.1:1919)
 #   CLAUDE_LOCAL_FREETOKEN_START command that brings FreeToken up (default: freetoken-serve start)
+#   CLAUDE_LOCAL_THINK        default for --think (off|on; unset = leave alone)
+#   CLAUDE_LOCAL_THINK_PORT   port for the --think shim   (default: 11502)
 #   FREETOKEN_PORT / FREETOKEN_MODEL / FREETOKEN_FT_BIN  freetoken-serve knobs (see that script)
 set -u
 
@@ -47,6 +49,9 @@ SHIM="${CLAUDE_LOCAL_SHIM:-$ROOT/shim.py}"
 DIRECT_URL=""
 DIRECT_PROVIDER=""
 HYBRID=0
+# off|on: rewrite the thinking mode Claude Code sends (it always says
+# "adaptive", which local servers ignore -> the checkpoint's own default wins).
+THINK="${CLAUDE_LOCAL_THINK:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --sglang)        DIRECT_URL="http://localhost:30000"; DIRECT_PROVIDER="sglang"; shift ;;
@@ -54,6 +59,9 @@ while [ $# -gt 0 ]; do
     --freetoken)     DIRECT_URL="${CLAUDE_LOCAL_FREETOKEN_BASE:-http://127.0.0.1:1919}"; DIRECT_PROVIDER="freetoken"; shift ;;
     --freetoken=*)   DIRECT_URL="${1#--freetoken=}"; DIRECT_PROVIDER="freetoken"; shift ;;
     --hybrid)        HYBRID=1; shift ;;
+    --think)         THINK="$2"; shift 2 ;;
+    --think=*)       THINK="${1#--think=}"; shift ;;
+    --no-think)      THINK="off"; shift ;;
     *) break ;;
   esac
 done
@@ -176,6 +184,33 @@ if [ -n "$DIRECT_URL" ]; then
       exit 1
     fi
     echo "claude-local: using model '$CLAUDE_LOCAL_MODEL' from $BASE (set CLAUDE_LOCAL_MODEL to override)" >&2
+  fi
+
+  # --think needs a field Claude Code won't send, so put the shim in front as a
+  # native passthrough that rewrites it. Without --think, stay truly direct.
+  if [ -n "$THINK" ]; then
+    case "$THINK" in
+      off|on) ;;
+      *) echo "claude-local: --think takes 'off' or 'on' (got '$THINK')" >&2; exit 1 ;;
+    esac
+    [ -f "$SHIM" ] || { echo "claude-local: shim not found at $SHIM" >&2; exit 1; }
+    THINK_PORT="${CLAUDE_LOCAL_THINK_PORT:-11502}"
+    UPSTREAM_BASE="$BASE"
+    BASE="http://127.0.0.1:$THINK_PORT"
+    if ! curl -sf -m 2 "$BASE/v1/models" >/dev/null 2>&1; then
+      echo "claude-local: thinking=$THINK — shim on :$THINK_PORT -> $UPSTREAM_BASE" >&2
+      mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/claude-local"
+      CLAUDE_LOCAL_SHIM_PORT="$THINK_PORT" CLAUDE_LOCAL_OLLAMA_URL="$UPSTREAM_BASE" \
+        CLAUDE_LOCAL_NATIVE=1 CLAUDE_LOCAL_THINKING="$THINK" \
+        nohup "$PY" "$SHIM" >>"${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.log" 2>&1 &
+      echo $! > "${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.pid"
+      i=0
+      while [ $i -lt 40 ]; do
+        curl -sf -m 2 "$BASE/v1/models" >/dev/null 2>&1 && break
+        i=$((i + 1)); sleep 0.25
+      done
+      [ $i -lt 40 ] || { echo "claude-local: shim failed to start; see ${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.log" >&2; exit 1; }
+    fi
   fi
 else
   BASE="http://127.0.0.1:$PORT"

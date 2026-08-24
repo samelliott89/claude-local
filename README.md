@@ -66,6 +66,7 @@ with `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, and
 claude-local --sglang                     # server on http://localhost:30000
 claude-local --sglang=http://host:port    # server elsewhere
 claude-local --freetoken                  # FreeToken engine on http://127.0.0.1:1919
+claude-local --freetoken --think off      # ...with chain-of-thought disabled
 ```
 
 SGLang serves the Anthropic Messages API natively (`/v1/messages`), so
@@ -256,6 +257,25 @@ env is set or the kernels will fail to build.
 VRAM: the engine and an SGLang server do not coexist — stop one before starting
 the other (`sglang-serve stop`, then `freetoken-serve start`, or vice versa).
 
+### Turning thinking down: `--think`
+
+```sh
+claude-local --freetoken --think off     # no chain-of-thought
+claude-local --freetoken --think on      # force it on
+```
+
+Claude Code always sends `thinking: {"type": "adaptive"}`. Local servers only
+act on `"enabled"` / `"disabled"`, so `adaptive` falls through to whatever the
+checkpoint defaults to — `xhigh` on Qwen3.8, which means it reasons at full
+effort about "say hi". `--think` puts the shim in front as a native passthrough
+and rewrites that one field. On an identical request: 75 output tokens / 2.9s
+became 4 tokens / 0.2s.
+
+Costs one local hop, so it is opt-in; without `--think` the direct modes stay
+direct. Graded levels (`low`/`medium`/`high`) are not available here —
+FreeToken takes `reasoning_effort` only on its OpenAI endpoint, and Claude Code
+speaks the Anthropic one.
+
 ### Hybrid: big model on SGLang, small model on Ollama
 
 ```sh
@@ -332,6 +352,9 @@ not like the model that wrote it.
 | `FREETOKEN_PORT` | `1919` | freetoken-serve listen port |
 | `FREETOKEN_MODEL` | first dir in `~/.freetoken/models` | freetoken-serve model path |
 | `FREETOKEN_FT_BIN` | `ft-freetoken` on PATH | freetoken-serve ft binary |
+| `FREETOKEN_ARGS` | tuned set (see script) | extra `ft serve` flags |
+| `CLAUDE_LOCAL_THINK` | — | default for `--think` (`off`/`on`) |
+| `CLAUDE_LOCAL_THINK_PORT` | `11502` | port for the `--think` shim |
 
 Shim log: `${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.log`
 (hybrid: `shim-hybrid.log`). SGLang server log:
