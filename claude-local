@@ -229,7 +229,16 @@ if ! curl -sf -m 2 "$BASE/v1/models" 2>/dev/null | grep -q "\"$CLAUDE_LOCAL_MODE
   echo "claude-local: note: '$CLAUDE_LOCAL_MODEL' not visible in $BASE/v1/models yet." >&2
 fi
 
+# Claude Code doesn't recognize local model names, so it assumes a 200k window
+# and auto-compacts early. Tell it the real one if /v1/models advertises it.
+if [ -z "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ]; then
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS=$(curl -sf -m 2 "$BASE/v1/models" 2>/dev/null \
+    | grep -o '"max_model_len"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 \
+    | grep -o '[0-9]*$')
+fi
+
 exec env \
+  ${CLAUDE_CODE_MAX_CONTEXT_TOKENS:+CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CLAUDE_CODE_MAX_CONTEXT_TOKENS"} \
   ANTHROPIC_BASE_URL="$BASE" \
   ANTHROPIC_MODEL="$CLAUDE_LOCAL_MODEL" \
   ANTHROPIC_DEFAULT_HAIKU_MODEL="$CLAUDE_LOCAL_MODEL" \
