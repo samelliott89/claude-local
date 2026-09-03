@@ -7,6 +7,7 @@ unit:
 	$(PY) tests/test_rewrite.py
 	$(PY) tests/test_routing.py
 	$(PY) tests/test_mcp_server.py
+	$(PY) tests/test_stream.py
 
 test: unit
 

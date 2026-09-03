@@ -53,9 +53,12 @@ cmd="${1:-status}"
 # /health answers 200 with {"status":"loading"} while weights are still being
 # read, so a bare 2xx check reports "up" minutes early and the first real
 # request 503s. Only "ok" means ready to serve.
-is_up() {
-  curl -sf -m 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
+health() { curl -sf -m 2 "http://127.0.0.1:$PORT/health" 2>/dev/null; }
+# "ok" | "loading" | "error" | "" (nothing listening)
+health_status() {
+  health | grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/'
 }
+is_up() { [ "$(health_status)" = "ok" ]; }
 
 # First real model dir under $MODEL_DIR (entries are symlinks to dirs, so use
 # a -d test that follows links rather than find -type d).
@@ -67,41 +70,54 @@ default_model() {
 
 case "$cmd" in
   start)
-    if is_up; then
-      echo "freetoken-serve: already running on :$PORT"
-      exit 0
+    case "$(health_status)" in
+      ok) echo "freetoken-serve: already running on :$PORT"; exit 0 ;;
+      "") ;;
+      # Listening but not ready: an engine is already loading (or latched in
+      # error). Don't launch a second one on the same port — it would grab
+      # GPU workers, die on the bind, and clobber the pidfile. Wait for it.
+      *)  echo "freetoken-serve: engine on :$PORT is still loading; waiting for it"; skip_spawn=1 ;;
+    esac
+    if [ -z "${skip_spawn:-}" ]; then
+      MODEL="${2:-${FREETOKEN_MODEL:-}}"
+      if [ -z "$MODEL" ]; then
+        MODEL="$(default_model)"
+      fi
+      [ -n "$MODEL" ] && [ -d "$MODEL" ] || {
+        echo "freetoken-serve: no model dir found (looked in $MODEL_DIR)." >&2
+        echo "freetoken-serve: pass a path, or set FREETOKEN_MODEL." >&2
+        exit 1
+      }
+      mkdir -p "$RUNDIR"
+      echo "freetoken-serve: starting $MODEL on :$PORT"
+      echo "freetoken-serve: log at $LOG"
+      # setsid gives the engine its own process group so stop can kill it and
+      # any workers it spawns in one shot.
+      # EXTRA_ARGS is deliberately unquoted — it is a flag list.
+      # shellcheck disable=SC2086
+      setsid nohup "$FT" serve --model-path "$MODEL" --port "$PORT" $EXTRA_ARGS >>"$LOG" 2>&1 &
+      echo $! > "$PIDFILE"
     fi
-    MODEL="${2:-${FREETOKEN_MODEL:-}}"
-    if [ -z "$MODEL" ]; then
-      MODEL="$(default_model)"
-    fi
-    [ -n "$MODEL" ] && [ -d "$MODEL" ] || {
-      echo "freetoken-serve: no model dir found (looked in $MODEL_DIR)." >&2
-      echo "freetoken-serve: pass a path, or set FREETOKEN_MODEL." >&2
-      exit 1
-    }
-    mkdir -p "$RUNDIR"
-    echo "freetoken-serve: starting $MODEL on :$PORT"
-    echo "freetoken-serve: log at $LOG"
-    # setsid gives the engine its own process group so stop can kill it and
-    # any workers it spawns in one shot.
-    # EXTRA_ARGS is deliberately unquoted — it is a flag list.
-    # shellcheck disable=SC2086
-    setsid nohup "$FT" serve --model-path "$MODEL" --port "$PORT" $EXTRA_ARGS >>"$LOG" 2>&1 &
-    echo $! > "$PIDFILE"
     # First start JIT-compiles kernels; model load takes a while regardless.
     i=0
     while [ $i -lt 360 ]; do
-      if is_up; then
-        echo "freetoken-serve: up — http://localhost:$PORT/v1"
-        exit 0
-      fi
+      st=$(health_status)
+      case "$st" in
+        ok) echo "freetoken-serve: up — http://localhost:$PORT/v1"; exit 0 ;;
+        error) echo "freetoken-serve: engine reports an error:" >&2; health >&2; echo >&2; exit 1 ;;
+      esac
       [ $((i % 15)) -eq 14 ] && echo "freetoken-serve: still loading ($((i * 2 + 2))s)..."
-      kill -0 "$(cat "$PIDFILE")" 2>/dev/null || {
-        echo "freetoken-serve: engine process died; last log lines:" >&2
-        tail -20 "$LOG" >&2
+      pid=$(cat "$PIDFILE" 2>/dev/null)
+      if [ -n "$pid" ]; then
+        kill -0 "$pid" 2>/dev/null || {
+          echo "freetoken-serve: engine process died; last log lines:" >&2
+          tail -20 "$LOG" >&2
+          exit 1
+        }
+      elif [ -z "$st" ]; then
+        echo "freetoken-serve: engine on :$PORT went away" >&2
         exit 1
-      }
+      fi
       i=$((i + 1))
       sleep 2
     done
@@ -127,12 +143,13 @@ case "$cmd" in
     echo "freetoken-serve: stopped"
     ;;
   status)
-    if is_up; then
-      echo "freetoken-serve: up on :$PORT"
-      curl -s "http://127.0.0.1:$PORT/v1/models" 2>/dev/null && echo
-    else
-      echo "freetoken-serve: down"
-    fi
+    st=$(health_status)
+    case "$st" in
+      ok) echo "freetoken-serve: up on :$PORT"
+          curl -s "http://127.0.0.1:$PORT/v1/models" 2>/dev/null && echo ;;
+      "") echo "freetoken-serve: down" ;;
+      *)  echo "freetoken-serve: $st on :$PORT"; health; echo ;;
+    esac
     ;;
   log)
     tail -f "$LOG"

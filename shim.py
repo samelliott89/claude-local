@@ -160,7 +160,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             self._send_simple(status, headers, body)
             return
         except urllib.error.URLError as err:
-            self._send_simple(502, {}, f"claude-local: cannot reach Ollama at {UPSTREAM} ({err.reason})".encode())
+            self._send_simple(502, {}, f"claude-local: cannot reach upstream {req.full_url} ({err.reason})".encode())
             return
 
         self.send_response(status)
@@ -179,7 +179,9 @@ class Proxy(http.server.BaseHTTPRequestHandler):
 
         try:
             while True:
-                chunk = resp.read(65536)
+                # read1, not read: read(n) on a chunked body blocks until n
+                # bytes or EOF, which turns an SSE stream into one burst.
+                chunk = resp.read1(65536)
                 if not chunk:
                     break
                 self.wfile.write(chunk)

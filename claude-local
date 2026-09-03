@@ -59,7 +59,7 @@ while [ $# -gt 0 ]; do
     --freetoken)     DIRECT_URL="${CLAUDE_LOCAL_FREETOKEN_BASE:-http://127.0.0.1:1919}"; DIRECT_PROVIDER="freetoken"; shift ;;
     --freetoken=*)   DIRECT_URL="${1#--freetoken=}"; DIRECT_PROVIDER="freetoken"; shift ;;
     --hybrid)        HYBRID=1; shift ;;
-    --think)         THINK="$2"; shift 2 ;;
+    --think)         THINK="${2:?--think needs off|on}"; shift 2 ;;
     --think=*)       THINK="${1#--think=}"; shift ;;
     --no-think)      THINK="off"; shift ;;
     *) break ;;
@@ -75,8 +75,27 @@ SGLANG_BASE="${CLAUDE_LOCAL_SGLANG_BASE:-http://localhost:30000}"
 HYBRID_PORT="${CLAUDE_LOCAL_HYBRID_PORT:-11501}"
 SMALL_MODEL="${CLAUDE_LOCAL_SMALL_MODEL:-hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ1_M}"
 
+RUN="${XDG_RUNTIME_DIR:-/tmp}/claude-local"
+mkdir -p "$RUN"
+
 # Is a server answering at <url>/v1/models?
 url_up() { curl -sf -m 2 "$1/v1/models" >/dev/null 2>&1; }
+
+# stale_shim <url> <name> <cfg>: a shim we started earlier keeps whatever
+# settings it was launched with, so `--think off` after `--think on` (or a
+# hybrid run with another SGLang URL) would silently reuse the wrong one.
+# Each launch records its settings in $RUN/shim-<name>.cfg; if a shim is up
+# and the record differs, stop it so the caller starts a fresh one.
+stale_shim() {
+  url_up "$1" || return 0
+  [ "$(cat "$RUN/shim-$2.cfg" 2>/dev/null)" = "$3" ] && return 0
+  echo "claude-local: $2 shim at $1 was started with other settings; restarting it" >&2
+  kill "$(cat "$RUN/shim-$2.pid" 2>/dev/null)" 2>/dev/null
+  i=0
+  while [ $i -lt 20 ] && url_up "$1"; do i=$((i + 1)); sleep 0.25; done
+  url_up "$1" && echo "claude-local: could not stop it (not ours?); reusing as-is" >&2
+  return 0
+}
 
 # Bring SGLang up if it is down (honors CLAUDE_LOCAL_NO_AUTOSTART).
 sglang_autostart() {
@@ -113,15 +132,19 @@ if [ "$HYBRID" = "1" ]; then
     [ -n "$CLAUDE_LOCAL_MODEL" ] || { echo "claude-local: no model id from $SGLANG_BASE; set CLAUDE_LOCAL_MODEL" >&2; exit 1; }
   fi
 
-  # Start the routing shim if it is not already up on its port.
+  # Start the routing shim if it is not already up on its port. A running
+  # shim started with other settings is restarted (see stale_shim).
+  if [ "${CLAUDE_LOCAL_NO_AUTOSTART:-0}" != "1" ]; then
+    stale_shim "$HBASE" hybrid "$SGLANG_BASE $OLLAMA_URL $CLAUDE_LOCAL_MODEL"
+  fi
   if [ "${CLAUDE_LOCAL_NO_AUTOSTART:-0}" != "1" ] && ! url_up "$HBASE"; then
     echo "claude-local: starting routing shim on $HBASE (sglang=$SGLANG_BASE ollama=$OLLAMA_URL)" >&2
-    mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/claude-local"
-    HLOG="${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim-hybrid.log"
+    HLOG="$RUN/shim-hybrid.log"
     CLAUDE_LOCAL_SHIM_PORT="$HYBRID_PORT" CLAUDE_LOCAL_OLLAMA_URL="$OLLAMA_URL" \
     CLAUDE_LOCAL_SGLANG_URL="$SGLANG_BASE" CLAUDE_LOCAL_SGLANG_MODELS="$CLAUDE_LOCAL_MODEL" \
       nohup "$PY" "$SHIM" >>"$HLOG" 2>&1 &
-    echo $! > "${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim-hybrid.pid"
+    echo $! > "$RUN/shim-hybrid.pid"
+    echo "$SGLANG_BASE $OLLAMA_URL $CLAUDE_LOCAL_MODEL" > "$RUN/shim-hybrid.cfg"
     i=0
     while [ $i -lt 60 ]; do url_up "$HBASE" && break; i=$((i + 1)); sleep 0.5; done
     url_up "$HBASE" || { echo "claude-local: hybrid shim failed to start; see $HLOG" >&2; exit 1; }
@@ -138,8 +161,14 @@ fi
 if [ -n "$DIRECT_URL" ]; then
   # Direct mode: the upstream speaks the Anthropic Messages API itself.
   BASE="${DIRECT_URL%/}"
+  # FreeToken answers /v1/models (200) while weights are still loading and
+  # the first real request 503s; only /health {"status":"ok"} means ready.
   server_up() {
-    curl -sf -m 2 "$BASE/v1/models" >/dev/null 2>&1
+    case "$DIRECT_PROVIDER" in
+      freetoken) curl -sf -m 2 "$BASE/health" 2>/dev/null \
+                   | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"' ;;
+      *)         url_up "$BASE" ;;
+    esac
   }
   if ! server_up; then
     # Autostart: a <PROVIDER>_START env names a command that starts the server
@@ -197,19 +226,20 @@ if [ -n "$DIRECT_URL" ]; then
     THINK_PORT="${CLAUDE_LOCAL_THINK_PORT:-11502}"
     UPSTREAM_BASE="$BASE"
     BASE="http://127.0.0.1:$THINK_PORT"
-    if ! curl -sf -m 2 "$BASE/v1/models" >/dev/null 2>&1; then
+    stale_shim "$BASE" think "$THINK $UPSTREAM_BASE"
+    if ! url_up "$BASE"; then
       echo "claude-local: thinking=$THINK — shim on :$THINK_PORT -> $UPSTREAM_BASE" >&2
-      mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/claude-local"
       CLAUDE_LOCAL_SHIM_PORT="$THINK_PORT" CLAUDE_LOCAL_OLLAMA_URL="$UPSTREAM_BASE" \
         CLAUDE_LOCAL_NATIVE=1 CLAUDE_LOCAL_THINKING="$THINK" \
-        nohup "$PY" "$SHIM" >>"${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.log" 2>&1 &
-      echo $! > "${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.pid"
+        nohup "$PY" "$SHIM" >>"$RUN/shim-think.log" 2>&1 &
+      echo $! > "$RUN/shim-think.pid"
+      echo "$THINK $UPSTREAM_BASE" > "$RUN/shim-think.cfg"
       i=0
       while [ $i -lt 40 ]; do
-        curl -sf -m 2 "$BASE/v1/models" >/dev/null 2>&1 && break
+        url_up "$BASE" && break
         i=$((i + 1)); sleep 0.25
       done
-      [ $i -lt 40 ] || { echo "claude-local: shim failed to start; see ${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.log" >&2; exit 1; }
+      [ $i -lt 40 ] || { echo "claude-local: shim failed to start; see $RUN/shim-think.log" >&2; exit 1; }
     fi
   fi
 else
@@ -241,11 +271,10 @@ else
   else
     if ! shim_up; then
       echo "claude-local: starting shim on 127.0.0.1:$PORT -> $OLLAMA_URL" >&2
-      mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/claude-local"
-      LOG="${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.log"
+      LOG="$RUN/shim.log"
       CLAUDE_LOCAL_SHIM_PORT="$PORT" CLAUDE_LOCAL_OLLAMA_URL="$OLLAMA_URL" \
         nohup "$PY" "$SHIM" >>"$LOG" 2>&1 &
-      echo $! > "${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.pid"
+      echo $! > "$RUN/shim.pid"
       # Ollama may be under load; be generous: ~30s budget, 2s per attempt.
       started=0
       i=0
