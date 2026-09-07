@@ -8,6 +8,7 @@ unit:
 	$(PY) tests/test_routing.py
 	$(PY) tests/test_mcp_server.py
 	$(PY) tests/test_stream.py
+	$(PY) tests/test_vllm.py
 
 test: unit
 

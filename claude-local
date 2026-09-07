@@ -6,6 +6,8 @@
 #
 #   claude-local                     # claude with defaults (Ollama + shim)
 #   claude-local --resume            # any claude flag
+#   claude-local --vllm              # tested NVFP4 + DFlash2 on :8000, thinking off
+#   claude-local --vllm --think on   # enable thinking through the passthrough shim
 #   claude-local --sglang            # SGLang server on :30000, no shim
 #   claude-local --sglang=http://host:port  # SGLang/Anthropic-compatible server elsewhere
 #   claude-local --freetoken         # FreeToken engine on :1919, no shim
@@ -54,6 +56,8 @@ HYBRID=0
 THINK="${CLAUDE_LOCAL_THINK:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
+    --vllm)         DIRECT_URL="${CLAUDE_LOCAL_VLLM_BASE:-http://127.0.0.1:8000}"; DIRECT_PROVIDER="vllm"; shift ;;
+    --vllm=*)       DIRECT_URL="${1#--vllm=}"; DIRECT_PROVIDER="vllm"; shift ;;
     --sglang)        DIRECT_URL="http://localhost:30000"; DIRECT_PROVIDER="sglang"; shift ;;
     --sglang=*)      DIRECT_URL="${1#--sglang=}"; DIRECT_PROVIDER="sglang"; shift ;;
     --freetoken)     DIRECT_URL="${CLAUDE_LOCAL_FREETOKEN_BASE:-http://127.0.0.1:1919}"; DIRECT_PROVIDER="freetoken"; shift ;;
@@ -65,6 +69,11 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+
+if [ "$DIRECT_PROVIDER" = "vllm" ]; then
+  THINK="${THINK:-off}"
+  export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-8192}"
+fi
 
 PORT="${CLAUDE_LOCAL_SHIM_PORT:-11500}"
 OLLAMA_URL="${CLAUDE_LOCAL_OLLAMA_URL:-http://localhost:11434}"
@@ -175,6 +184,12 @@ if [ -n "$DIRECT_URL" ]; then
     # and returns once it is healthy. If unset, the matching *-serve script on
     # PATH is used. Disabled by CLAUDE_LOCAL_NO_AUTOSTART=1.
     case "$DIRECT_PROVIDER" in
+      vllm)
+        starter="${CLAUDE_LOCAL_VLLM_START:-}"
+        if [ -z "$starter" ] && [ "$BASE" = "http://127.0.0.1:8000" ] \
+            && command -v vllm-serve >/dev/null 2>&1; then
+          starter="vllm-serve start"
+        fi ;;
       freetoken)
         starter="${CLAUDE_LOCAL_FREETOKEN_START:-}"
         # Only manage the default local port; don't "fix" an unreachable custom
@@ -223,17 +238,19 @@ if [ -n "$DIRECT_URL" ]; then
       *) echo "claude-local: --think takes 'off' or 'on' (got '$THINK')" >&2; exit 1 ;;
     esac
     [ -f "$SHIM" ] || { echo "claude-local: shim not found at $SHIM" >&2; exit 1; }
-    THINK_PORT="${CLAUDE_LOCAL_THINK_PORT:-11502}"
+    default_think_port=11502
+    [ "$DIRECT_PROVIDER" = "vllm" ] && default_think_port=11503
+    THINK_PORT="${CLAUDE_LOCAL_THINK_PORT:-$default_think_port}"
     UPSTREAM_BASE="$BASE"
     BASE="http://127.0.0.1:$THINK_PORT"
-    stale_shim "$BASE" think "$THINK $UPSTREAM_BASE"
+    stale_shim "$BASE" think "$THINK $UPSTREAM_BASE $DIRECT_PROVIDER"
     if ! url_up "$BASE"; then
       echo "claude-local: thinking=$THINK — shim on :$THINK_PORT -> $UPSTREAM_BASE" >&2
       CLAUDE_LOCAL_SHIM_PORT="$THINK_PORT" CLAUDE_LOCAL_OLLAMA_URL="$UPSTREAM_BASE" \
-        CLAUDE_LOCAL_NATIVE=1 CLAUDE_LOCAL_THINKING="$THINK" \
+        CLAUDE_LOCAL_NATIVE=1 CLAUDE_LOCAL_THINKING="$THINK" CLAUDE_LOCAL_THINK_PROVIDER="$DIRECT_PROVIDER" \
         nohup "$PY" "$SHIM" >>"$RUN/shim-think.log" 2>&1 &
       echo $! > "$RUN/shim-think.pid"
-      echo "$THINK $UPSTREAM_BASE" > "$RUN/shim-think.cfg"
+      echo "$THINK $UPSTREAM_BASE $DIRECT_PROVIDER" > "$RUN/shim-think.cfg"
       i=0
       while [ $i -lt 40 ]; do
         url_up "$BASE" && break
@@ -295,10 +312,14 @@ fi
 
 # Claude Code doesn't recognize local model names, so it assumes a 200k window
 # and auto-compacts early. Tell it the real one if /v1/models advertises it.
-if [ -z "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ]; then
-  CLAUDE_CODE_MAX_CONTEXT_TOKENS=$(curl -sf -m 2 "$BASE/v1/models" 2>/dev/null \
-    | grep -o '"max_model_len"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 \
-    | grep -o '[0-9]*$')
+server_context=$(curl -sf -m 2 "$BASE/v1/models" 2>/dev/null \
+  | grep -o '"max_model_len"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 \
+  | grep -o '[0-9]*$')
+if [ -n "$server_context" ]; then
+  if [ -z "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ] || \
+      [ "$CLAUDE_CODE_MAX_CONTEXT_TOKENS" -gt "$server_context" ] 2>/dev/null; then
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS="$server_context"
+  fi
 fi
 
 exec env \

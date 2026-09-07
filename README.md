@@ -276,6 +276,48 @@ direct. Graded levels (`low`/`medium`/`high`) are not available here —
 FreeToken takes `reasoning_effort` only on its OpenAI endpoint, and Claude Code
 speaks the Anthropic one.
 
+### vLLM: `--vllm` and `vllm-serve`
+
+```sh
+claude-local --vllm                  # vLLM server on :8000, thinking off
+claude-local --vllm --think on       # enable thinking via passthrough shim
+claude-local --vllm=http://host:port # custom server (omit /v1)
+```
+
+vLLM serves an OpenAI-compatible API, so `--vllm` routes through the shim on
+port 11503 (a dedicated port to avoid colliding with the SGLang think shim on
+11502). The shim translates `thinking` into `chat_template_kwargs.enable_thinking`
+and passes everything else through. A context-budget 400 triggers one retry
+with a reduced `max_tokens` (computed via `/v1/messages/count_tokens`);
+conversation text is preserved.
+
+`vllm-serve` is the reference launcher, mirroring `sglang-serve`:
+
+```sh
+vllm-serve start              # serve $VLLM_MODEL
+vllm-serve start <path|id>    # serve a specific model
+vllm-serve stop               # stop, kill the whole process group
+vllm-serve status
+vllm-serve log
+```
+
+Defaults: 128K context, 4 sequences, FP8 KV cache, 0.72 GPU memory fraction,
+7 speculative tokens (DFlash2). `VLLM_DRAFT_MODEL=""` disables speculation.
+Every knob is env-overridable: `VLLM_VENV`, `VLLM_PORT`, `VLLM_MODEL`,
+`VLLM_MAX_LEN`, `VLLM_MEM_FRACTION`, `VLLM_DRAFT_MODEL`, `VLLM_DRAFT_TOKENS`,
+`VLLM_MAX_NUM_SEQS`, `VLLM_REASONING_PARSER`, `VLLM_TOOL_PARSER`,
+`VLLM_EXTRA_ARGS`, `VLLM_LOCAL_CACHE_BASE`.
+
+Blackwell (sm_120) notes: the venv's `nvidia/cu13` toolkit is placed on
+`PATH`/`CUDA_HOME`/`LD_LIBRARY_PATH` so FlashInfer can describe the GPU.
+`FLASHINFER_DISABLE_VERSION_CHECK=1` handles the cubin/python version mismatch.
+`FlashInferFP8ScaledMMLinearKernel` is disabled (cuDNN mismatch); the native
+CUTLASS NVFP4 kernel remains enabled. This is a machine-specific tested preset,
+not a claim that every NVFP4 model supports these settings.
+
+VRAM: vLLM and SGLang do not coexist on one GPU — stop one before starting
+the other.
+
 ### Hybrid: big model on SGLang, small model on Ollama
 
 ```sh
@@ -355,11 +397,14 @@ not like the model that wrote it.
 | `FREETOKEN_ARGS` | tuned set (see script) | extra `ft serve` flags |
 | `CLAUDE_LOCAL_THINK` | — | default for `--think` (`off`/`on`) |
 | `CLAUDE_LOCAL_THINK_PORT` | `11502` | port for the `--think` shim |
+| `CLAUDE_LOCAL_VLLM_BASE` | `http://127.0.0.1:8000` | vLLM URL for `--vllm` |
+| `CLAUDE_LOCAL_VLLM_START` | `vllm-serve start` | command to bring vLLM up |
 
 Shim log: `${XDG_RUNTIME_DIR:-/tmp}/claude-local/shim.log`
 (hybrid: `shim-hybrid.log`). SGLang server log:
 `${XDG_RUNTIME_DIR:-/tmp}/sglang-serve/server.log`. FreeToken engine log:
-`${XDG_RUNTIME_DIR:-/tmp}/freetoken-serve/server.log`
+`${XDG_RUNTIME_DIR:-/tmp}/freetoken-serve/server.log`. vLLM server log:
+`${XDG_RUNTIME_DIR:-/tmp}/vllm-serve/server.log`.
 
 ## MCP and connectors
 

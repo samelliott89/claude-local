@@ -18,6 +18,7 @@ install -m 0755 "$ROOT/shim.py" "$DEST/shim.py"
 install -m 0755 "$ROOT/sglang-serve" "$DEST/sglang-serve"
 install -m 0755 "$ROOT/sglang-stats" "$DEST/sglang-stats"
 install -m 0755 "$ROOT/freetoken-serve" "$DEST/freetoken-serve"
+install -m 0755 "$ROOT/vllm-serve" "$DEST/vllm-serve"
 
 case ":$PATH:" in
   *":$DEST:"*) : ;;

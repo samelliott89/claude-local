@@ -18,11 +18,13 @@ Env:  CLAUDE_LOCAL_SHIM_PORT     listen port       (default 11500)
 import http.server
 import json
 import os
+import re
 import socketserver
 import sys
 import threading
 import urllib.error
 import urllib.request
+import urllib.parse
 
 HOST = os.environ.get("CLAUDE_LOCAL_SHIM_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CLAUDE_LOCAL_SHIM_PORT", "11500"))
@@ -76,6 +78,9 @@ def set_thinking(body: bytes) -> bytes:
     if not isinstance(req, dict):
         return body
     req["thinking"] = {"type": "disabled" if THINKING == "off" else "enabled"}
+    if os.environ.get("CLAUDE_LOCAL_THINK_PROVIDER") == "vllm":
+        template = req.setdefault("chat_template_kwargs", {})
+        template["enable_thinking"] = THINKING == "on"
     return json.dumps(req).encode()
 
 
@@ -109,6 +114,35 @@ def rewrite(body: bytes) -> bytes:
     if not changed:
         return body
     return json.dumps(req).encode("utf-8")
+
+
+def context_retry(req, error_body):
+    """Retry a vLLM output-budget rejection without dropping conversation text.
+
+    The error's 'at least' input count can be a lower bound. Ask the server
+    to tokenize the complete request before calculating the remaining space.
+    """
+    url = urllib.parse.urlsplit(req.full_url)
+    if (os.environ.get("CLAUDE_LOCAL_THINK_PROVIDER") != "vllm"
+            or req.get_method() != "POST" or url.path != "/v1/messages"):
+        return None
+    match = re.search(r"maximum context length is (\d+) tokens", error_body.decode(errors="replace"))
+    if not match:
+        return None
+    payload = json.loads(req.data)
+    count_req = urllib.request.Request(
+        urllib.parse.urlunsplit(url._replace(path=url.path + "/count_tokens")), data=req.data,
+        headers={k: v for k, v in req.header_items() if k.lower() != "content-length"},
+        method="POST")
+    with urllib.request.urlopen(count_req, timeout=60) as response:
+        count = int(json.load(response)["input_tokens"])
+    available = int(match.group(1)) - count - 64
+    if available < 1 or available >= payload["max_tokens"]:
+        return None
+    payload["max_tokens"] = available
+    return urllib.request.Request(
+        req.full_url, data=json.dumps(payload).encode(), method="POST",
+        headers={k: v for k, v in req.header_items() if k.lower() != "content-length"})
 
 
 class Proxy(http.server.BaseHTTPRequestHandler):
@@ -146,7 +180,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             req.add_header(key, value)
         return req
 
-    def _stream_response(self, req):
+    def _stream_response(self, req, allow_context_retry=True):
         try:
             # No timeout arg: we must stream for the whole generation.
             # (timeout=0 would mean non-blocking sockets, not "infinite".)
@@ -157,6 +191,20 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             status = err.code
             headers = err.headers
             body = err.read()
+            if status == 400 and allow_context_retry:
+                try:
+                    retry = context_retry(req, body)
+                except urllib.error.HTTPError as count_error:
+                    count_body = count_error.read()
+                    if count_error.code == 400 and b"maximum context length" in count_body:
+                        self._send_simple(count_error.code, count_error.headers, count_body)
+                        return
+                    retry = None
+                except (ValueError, KeyError, TypeError, urllib.error.URLError, TimeoutError):
+                    retry = None
+                if retry is not None:
+                    self.log_message("retrying with max_tokens=%s to fit context", json.loads(retry.data)["max_tokens"])
+                    return self._stream_response(retry, allow_context_retry=False)
             self._send_simple(status, headers, body)
             return
         except urllib.error.URLError as err:

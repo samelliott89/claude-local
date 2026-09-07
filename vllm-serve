@@ -1,0 +1,143 @@
+#!/bin/sh
+# vllm-serve: start/stop/status for a local vLLM server.
+#
+#   vllm-serve start            # $VLLM_MODEL (default: Qwen3.8-27B-NVFP4 + DFlash2)
+#   vllm-serve start <path|id>  # any model path / HF id
+#   vllm-serve stop
+#   vllm-serve status
+#   vllm-serve log              # tail the server log
+#
+# Serves an OpenAI-compatible API on http://localhost:$VLLM_PORT/v1.
+# Same role as sglang-serve; every knob is env-overridable.
+#
+# Env (all optional):
+#   VLLM_VENV          venv holding vllm         (default: ~/venvs/vllm)
+#   VLLM_PORT          listen port               (default: 8000)
+#   VLLM_MODEL         model to serve
+#   VLLM_MAX_LEN       --max-model-len           (default: 131072)
+#   VLLM_MEM_FRACTION  --gpu-memory-utilization  (default: 0.72)
+#   VLLM_DRAFT_MODEL   DFlash drafter path       (empty = no speculation)
+#   VLLM_DRAFT_TOKENS  speculative tokens        (default: 7)
+#   VLLM_EXTRA_ARGS    appended to the launch command verbatim
+set -u
+
+VENV="${VLLM_VENV:-$HOME/venvs/vllm}"
+# The venv ships a CUDA-13 toolkit. Without pointing FlashInfer at it, it
+# picks up the system nvcc (12.6), cannot describe an sm_120 Blackwell GPU
+# ("SM 12.x requires CUDA >= 12.9") and the engine core dies on startup.
+NV="$VENV/lib/python3.12/site-packages/nvidia/cu13"
+PORT="${VLLM_PORT:-8000}"
+RUNDIR="${XDG_RUNTIME_DIR:-/tmp}/vllm-serve"
+LOG="$RUNDIR/server.log"
+PIDFILE="$RUNDIR/server.pid"
+MODEL="${VLLM_MODEL:-$HOME/models/Qwen3.8-27B-NVFP4}"
+DRAFT_MODEL="${VLLM_DRAFT_MODEL-$HOME/models/Qwen3.8-27B-DFlash2}"
+
+cmd="${1:-status}"
+
+is_up() { curl -sf -m 2 "http://localhost:$PORT/health" >/dev/null 2>&1; }
+
+case "$cmd" in
+  start)
+    if is_up; then
+      echo "vllm-serve: already running on :$PORT"
+      exit 0
+    fi
+    [ -n "${2:-}" ] && MODEL="$2"
+    mkdir -p "$RUNDIR"
+    # vLLM sizes its KV pool from free VRAM at startup and refuses to start
+    # if less than VLLM_MEM_FRACTION of the card is free. Evict Ollama first.
+    if command -v ollama >/dev/null 2>&1 && [ -n "$(ollama ps 2>/dev/null | sed 1d)" ]; then
+      echo "vllm-serve: unloading Ollama models first"
+      ollama ps | sed 1d | awk '{print $1}' | while read -r m; do
+        [ -n "$m" ] && ollama stop "$m" >/dev/null 2>&1
+      done
+    fi
+    SPEC_ARGS=""
+    if [ -n "$DRAFT_MODEL" ]; then
+      # Match the measured DFlash2 configuration explicitly.
+      SPEC_ARGS="--speculative-config {\"method\":\"dflash\",\"model\":\"$DRAFT_MODEL\",\"num_speculative_tokens\":${VLLM_DRAFT_TOKENS:-7}}"
+      echo "vllm-serve: starting $MODEL + $DRAFT_MODEL drafter on :$PORT"
+    else
+      echo "vllm-serve: starting $MODEL on :$PORT"
+    fi
+    echo "vllm-serve: log at $LOG"
+    # Use installed CUDA libraries and the tested SM120 kernel workaround.
+    mkdir -p "$RUNDIR/cuda-links"
+    for lib in cudart cublas cublasLt; do
+      ln -sf "$NV/lib/lib$lib.so.13" "$RUNDIR/cuda-links/lib$lib.so"
+    done
+    export NVCC_PREPEND_FLAGS="-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK -I$NV/include"
+    export VLLM_DISABLED_KERNELS="${VLLM_DISABLED_KERNELS-FlashInferFP8ScaledMMLinearKernel}"
+    export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
+    export VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
+    export MAX_JOBS=8 TORCHINDUCTOR_COMPILE_THREADS=8 FLASHINFER_NVCC_THREADS=2
+    # Reuse the successful experiment's compilation caches.
+    cache_base="${VLLM_LOCAL_CACHE_BASE:-/home/sam/Documents/Codex/2026-09-05/e/work}"
+    export VLLM_CACHE_ROOT="$cache_base/vllm-cache"
+    export FLASHINFER_WORKSPACE_BASE="$cache_base/vllm-flashinfer"
+    export TORCHINDUCTOR_CACHE_DIR="$cache_base/vllm-inductor"
+    export TRITON_CACHE_DIR="$cache_base/vllm-triton"
+    : >"$LOG"
+    # shellcheck disable=SC2086
+    PATH="$NV/bin:$VENV/bin:$PATH" CUDA_HOME="$NV" \
+    LIBRARY_PATH="$RUNDIR/cuda-links:$NV/lib" LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cudnn/lib:$NV/lib" \
+    FLASHINFER_DISABLE_VERSION_CHECK=1 \
+    setsid nohup "$VENV/bin/vllm" serve "$MODEL" \
+      --served-model-name "${VLLM_SERVED_MODEL_NAME:-$(basename "$MODEL" | tr "[:upper:]" "[:lower:]")}" \
+      --host 127.0.0.1 --kv-cache-dtype fp8 --max-num-seqs "${VLLM_MAX_NUM_SEQS:-4}" \
+      --port "$PORT" \
+      --max-model-len "${VLLM_MAX_LEN:-131072}" \
+      --gpu-memory-utilization "${VLLM_MEM_FRACTION:-0.72}" \
+      --reasoning-parser "${VLLM_REASONING_PARSER:-qwen3}" \
+      --enable-auto-tool-choice --tool-call-parser "${VLLM_TOOL_PARSER:-qwen3_coder}" \
+      $SPEC_ARGS ${VLLM_EXTRA_ARGS:-} >>"$LOG" 2>&1 &
+    echo $! > "$PIDFILE"
+    i=0
+    while [ $i -lt 360 ]; do
+      if is_up; then
+        echo "vllm-serve: up — http://localhost:$PORT/v1"
+        grep -o "GPU KV cache size: [0-9,]* tokens" "$LOG" | tail -1 | sed 's/^/vllm-serve: /'
+        exit 0
+      fi
+      [ $((i % 15)) -eq 14 ] && echo "vllm-serve: still loading ($((i * 2 + 2))s)..."
+      # The API server outlives a dead engine core, so check the log too.
+      if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null \
+          || grep -q "EngineCore failed to start" "$LOG"; then
+        echo "vllm-serve: server failed; root cause:" >&2
+        grep -E "^\(EngineCore.*(Error|Exception):" "$LOG" | tail -1 >&2
+        "$0" stop >/dev/null
+        exit 1
+      fi
+      i=$((i + 1))
+      sleep 2
+    done
+    echo "vllm-serve: not up after 12 min; check $LOG" >&2
+    exit 1
+    ;;
+  stop)
+    # Kill the whole process group — the EngineCore child holds the VRAM.
+    if [ -f "$PIDFILE" ]; then
+      pid=$(cat "$PIDFILE")
+      /bin/kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    fi
+    # Only stop this launcher's recorded process group.
+    rm -f "$PIDFILE"
+    echo "vllm-serve: stopped"
+    ;;
+  status)
+    if is_up; then
+      echo "vllm-serve: up on :$PORT"
+      curl -s "http://localhost:$PORT/v1/models" 2>/dev/null && echo
+    else
+      echo "vllm-serve: down"
+    fi
+    ;;
+  log)
+    tail -f "$LOG"
+    ;;
+  *)
+    echo "usage: vllm-serve {start [<model>]|stop|status|log}" >&2
+    exit 1
+    ;;
+esac
