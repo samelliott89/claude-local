@@ -1,10 +1,12 @@
 # claude-local
 
 Run [Claude Code](https://claude.com/claude-code) on local models.
-Uses [Ollama](https://ollama.com). No API key. No per-token billing.
+Works with [Ollama](https://ollama.com), SGLang, vLLM, or FreeToken.
+No API key. No per-token billing.
 
 ```
 you → claude-local → Claude Code → shim (:11500) → Ollama (:11434) → your GPU
+you → claude-local --sglang|--vllm|--freetoken → Claude Code → server → your GPU
 ```
 
 ## Why this exists
@@ -30,7 +32,8 @@ straight at Ollama and drop the shim.
 - macOS or Linux (Windows: use WSL)
 - Python 3.8+ (standard library only)
 - `curl`
-- Ollama running, with at least one local model
+- Ollama running with at least one local model — or an SGLang, vLLM, or
+  FreeToken server (see below)
 - Claude Code installed (`claude --version`)
 
 ## Install
@@ -71,20 +74,23 @@ claude-local --freetoken                  # FreeToken engine on http://127.0.0.1
 claude-local --freetoken --think off      # ...with chain-of-thought disabled
 ```
 
-SGLang serves the Anthropic Messages API natively (`/v1/messages`), so
-`--sglang` skips the shim entirely and points Claude Code straight at the
-server. The model is auto-picked from the server's `/v1/models`
+All three serve the Anthropic Messages API natively (`/v1/messages`), so
+these modes point Claude Code straight at the server with no Ollama shim
+in the way. The model is auto-picked from the server's `/v1/models`
 (`CLAUDE_LOCAL_MODEL` overrides). Any server that speaks `/v1/messages`
-works — the flag name is just honest about what it was built for.
-Launcher-owned flags must come before `claude`'s own args.
+works with `--sglang=<url>` — the flag name is just honest about what it
+was built for. Launcher-owned flags must come before `claude`'s own args.
 
 If the server is down, the launcher starts it: it runs
-`CLAUDE_LOCAL_SGLANG_START` if set, else `sglang-serve start` if a script
-by that name is on PATH. The command must return once the server is
+`CLAUDE_LOCAL_<PROVIDER>_START` if set, else the matching `*-serve start`
+script if one is on PATH. The command must return once the server is
 healthy. `CLAUDE_LOCAL_NO_AUTOSTART=1` disables this, like the shim.
-It deliberately sets **no** `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`.
+Every mode deliberately sets **no** `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`.
 Your Claude login (if any) stays the auth source.
 That keeps claude.ai connectors available (see below).
+
+Each server has its own section below. The SGLang notes come first because
+SGLang is the reference setup and most of its GPU lessons carry over.
 
 #### Don't "fix" the FlashInfer version mismatch
 
@@ -262,8 +268,9 @@ the other (`sglang-serve stop`, then `freetoken-serve start`, or vice versa).
 ### Turning thinking down: `--think`
 
 ```sh
-claude-local --freetoken --think off     # no chain-of-thought
+claude-local --sglang --think off        # no chain-of-thought
 claude-local --freetoken --think on      # force it on
+claude-local --vllm                      # vLLM defaults to off; --think on re-enables
 ```
 
 Claude Code always sends `thinking: {"type": "adaptive"}`. Local servers only
@@ -273,8 +280,9 @@ effort about "say hi". `--think` puts the shim in front as a native passthrough
 and rewrites that one field. On an identical request: 75 output tokens / 2.9s
 became 4 tokens / 0.2s.
 
-Costs one local hop, so it is opt-in; without `--think` the direct modes stay
-direct. Graded levels (`low`/`medium`/`high`) are not available here —
+Costs one local hop, so it is opt-in on SGLang and FreeToken; without
+`--think` those modes stay direct. `--vllm` always runs the hop (next
+section). Graded levels (`low`/`medium`/`high`) are not available here —
 FreeToken takes `reasoning_effort` only on its OpenAI endpoint, and Claude Code
 speaks the Anthropic one.
 
@@ -286,12 +294,16 @@ claude-local --vllm --think on       # enable thinking via passthrough shim
 claude-local --vllm=http://host:port # custom server (omit /v1)
 ```
 
-vLLM serves an OpenAI-compatible API, so `--vllm` routes through the shim on
-port 11503 (a dedicated port to avoid colliding with the SGLang think shim on
-11502). The shim translates `thinking` into `chat_template_kwargs.enable_thinking`
-and passes everything else through. A context-budget 400 triggers one retry
-with a reduced `max_tokens` (computed via `/v1/messages/count_tokens`);
-conversation text is preserved.
+vLLM serves `/v1/messages` too, but it only honours the thinking switch
+through `chat_template_kwargs.enable_thinking`, so `--vllm` always puts the
+`--think` passthrough shim in front — on port 11503, so it never collides
+with an SGLang or FreeToken `--think` shim on 11502. The shim sets that one
+field and passes everything else through. If vLLM rejects a request for
+exceeding the context window, the shim counts the input via
+`/v1/messages/count_tokens` and retries once with a smaller `max_tokens`;
+conversation text is never trimmed. Output defaults to 8,192 tokens
+(`CLAUDE_CODE_MAX_OUTPUT_TOKENS` overrides), and the launcher clamps
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the server's advertised `max_model_len`.
 
 `vllm-serve` is the reference launcher, mirroring `sglang-serve`:
 
@@ -317,8 +329,8 @@ Blackwell (sm_120) notes: the venv's `nvidia/cu13` toolkit is placed on
 CUTLASS NVFP4 kernel remains enabled. This is a machine-specific tested preset,
 not a claim that every NVFP4 model supports these settings.
 
-VRAM: vLLM and SGLang do not coexist on one GPU — stop one before starting
-the other.
+VRAM: vLLM, SGLang, and FreeToken each size against free VRAM at startup.
+Run one at a time.
 
 ### Hybrid: big model on SGLang, small model on Ollama
 
@@ -443,7 +455,8 @@ set the base URL to `https://<your-tunnel>/v1`.
 ## Tests
 
 ```sh
-make unit        # rewriter + MCP server protocol. No LLM, no network.
+make unit        # rewriter, routing, streaming, vLLM adapter, MCP protocol.
+                 # No LLM, no network.
 make e2e         # full chain: model → shim → Claude Code → MCP tool call.
                  # Needs Ollama + a model. Set CLAUDE_LOCAL_MODEL to pick.
 ```
@@ -451,7 +464,7 @@ make e2e         # full chain: model → shim → Claude Code → MCP tool call.
 ## Uninstall
 
 ```sh
-./uninstall.sh   # removes the two installed files, stops the shim
+./uninstall.sh   # removes the installed scripts, stops the shim
 ```
 
 ## Troubleshooting
@@ -463,6 +476,7 @@ make e2e         # full chain: model → shim → Claude Code → MCP tool call.
 | Slow first reply, then fast | normal: the model loads into VRAM, then the KV cache keeps later turns fast |
 | Connectors missing in a session | an `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` is set in the environment. Unset it |
 | `403` from Ollama via a tunnel | add `--http-host-header localhost:11434` to cloudflared |
+| vLLM `maximum context length` 400 that survives the shim's retry | the input alone fills the window. `/compact`, or raise `VLLM_MAX_LEN` and restart |
 
 ## License
 
