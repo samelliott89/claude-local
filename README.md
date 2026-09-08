@@ -51,7 +51,7 @@ Or skip the installer entirely — the repo works in place:
 
 ```sh
 claude-local                              # pick the first model in `ollama list`
-CLAUDE_LOCAL_MODEL=deepseek-r1 claude-local
+CLAUDE_LOCAL_MODEL=qwen3:8b claude-local   # any tag from `ollama list`
 claude-local --resume                     # all extra args pass to claude
 claude-local -p "say hi" --max-turns 1    # headless
 ```
