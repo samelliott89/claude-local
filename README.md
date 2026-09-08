@@ -60,11 +60,13 @@ The launcher starts the shim if it is not running, then execs `claude`
 with `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, and
 `ANTHROPIC_DEFAULT_HAIKU_MODEL` set.
 
-### SGLang and other Anthropic-native servers
+### SGLang, vLLM, FreeToken: direct servers
 
 ```sh
-claude-local --sglang                     # server on http://localhost:30000
+claude-local --sglang                     # SGLang on http://localhost:30000
 claude-local --sglang=http://host:port    # server elsewhere
+claude-local --vllm                       # vLLM on http://127.0.0.1:8000, thinking off
+claude-local --vllm --think on            # ...with chain-of-thought enabled
 claude-local --freetoken                  # FreeToken engine on http://127.0.0.1:1919
 claude-local --freetoken --think off      # ...with chain-of-thought disabled
 ```
